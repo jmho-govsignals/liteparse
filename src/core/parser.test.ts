@@ -142,6 +142,7 @@ const {
       h: r.bbox[3] - r.bbox[1],
       fontName: "OCR",
       fontSize: r.bbox[3] - r.bbox[1],
+      confidence: Math.round(r.confidence * 1000) / 1000,
     }));
 
   const mockTextItemsJson = mockOcrResults.map((r) => ({
@@ -152,6 +153,7 @@ const {
     height: r.bbox[3] - r.bbox[1],
     fontName: "OCR",
     fontSize: r.bbox[3] - r.bbox[1],
+    confidence: Math.round(r.confidence * 1000) / 1000,
   }));
 
   const mockParsedPagesOcr = [
@@ -454,6 +456,8 @@ vi.mock("../engines/pdf/pdfium-renderer.js", async () => {
       class {
         constructor() {}
 
+        loadDocument = vi.fn(async () => {});
+        closeDocument = vi.fn();
         renderPageToBuffer = vi.fn(async () => Buffer.from(new Uint8Array([1, 2, 3, 4, 5])));
         close = vi.fn(async () => {});
       }

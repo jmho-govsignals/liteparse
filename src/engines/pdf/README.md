@@ -47,9 +47,15 @@ PDF uses a bottom-left origin with Y pointing up. PDF.js provides transformation
 - `getRotation()` - Extract rotation angle from matrix
 
 **Text Decoding:**
-Handles special PDF.js markers for problematic fonts:
-- Decodes `:->|>_<charCode>_<fontChar>_<|<-:` format
-- Handles pipe-separated characters: `|a| |b| |c|` → `abc`
+Handles special PDF.js markers for problematic ("buggy") fonts — fonts whose ToUnicode/encoding maps glyphs to control characters or Private Use Area code points:
+- Our patched PDF.js emits markers in the format `:->|>_<glyphId>_<fontCharCode>@<glyphName>@<|<-:` for buggy font glyphs
+- The glyph name comes from the font's `/Differences` or `/Encoding` dictionary
+- `decodeBuggyFontMarkers()` resolves glyph names to Unicode via the `ADOBE_GLYPH_MAP` (a subset of the Adobe Glyph List)
+- Falls back to ASCII char code for glyphs in range 32-126
+- Handles underscore-separated composite glyph names (e.g., `f_i` → "fi")
+- Handles `uniXXXX` glyph name convention
+- Also handles pipe-separated characters: `|a| |b| |c|` → `abc`
+- `stripControlChars()` maps Windows-1252 C1 range (0x80-0x9F) to proper Unicode and decomposes Unicode ligatures (U+FB00-FB06) to plain text
 
 **Garbled Font Detection:**
 Some PDFs have fonts with corrupted or missing ToUnicode mappings, causing PDF.js to output characters mapped to unexpected Unicode code points. The `isGarbledFontOutput()` function detects this by identifying:

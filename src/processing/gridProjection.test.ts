@@ -2,6 +2,7 @@ import { expect, describe, it } from "vitest";
 import { bboxToLine, projectPagesToGrid, projectToGrid } from "./gridProjection";
 import { ProjectionTextBox } from "../core/types";
 import { DEFAULT_CONFIG } from "../core/config";
+import { NOOP_LOGGER } from "./gridDebugLogger";
 
 describe("test bboxToLine", () => {
   it("test  same line that can merge", () => {
@@ -215,6 +216,42 @@ describe("test bboxToLine", () => {
     const result = bboxToLine(textBbox, medianWidth, medianHeight);
     expect(result).toStrictEqual(expectedOutput);
   });
+
+  it("uses representative line height for bullet-line spacing", () => {
+    const textBbox = [
+      { str: "Recommendation", x: 7.68, y: 6.24, w: 66.24, h: 6.24, strLength: 14 },
+      { str: "summary", x: 79.68, y: 8.16, w: 32.64, h: 5.76, strLength: 7 },
+      { str: "-", x: 8.16, y: 30.72, w: 2.4, h: 0.48, strLength: 1 },
+      { str: "Primary", x: 17.28, y: 26.88, w: 32.64, h: 7.68, strLength: 7 },
+      { str: "choice:", x: 55.2, y: 26.88, w: 32.16, h: 6.24, strLength: 7 },
+      { str: "Apache", x: 93.6, y: 26.88, w: 28.32, h: 7.68, strLength: 6 },
+      { str: "ECharts", x: 127.68, y: 26.88, w: 32.64, h: 6.24, strLength: 7 },
+    ];
+
+    const result = bboxToLine(textBbox, 4.32, 6.24);
+    const renderedLines = result.map((line) => line.map((bbox) => bbox.str).join(" "));
+
+    expect(renderedLines).toStrictEqual([
+      "Recommendation summary",
+      "",
+      "- Primary choice: Apache ECharts",
+    ]);
+  });
+
+  it("preserves blank lines for regular non-bulleted text", () => {
+    const textBbox = [
+      { str: "Heading", x: 10, y: 10, w: 42, h: 6, strLength: 7 },
+      { str: "First", x: 10, y: 28, w: 26, h: 6, strLength: 5 },
+      { str: "paragraph", x: 40, y: 28, w: 44, h: 6, strLength: 9 },
+      { str: "Second", x: 10, y: 34, w: 34, h: 6, strLength: 6 },
+      { str: "line", x: 48, y: 34, w: 20, h: 6, strLength: 4 },
+    ];
+
+    const result = bboxToLine(textBbox, 5, 6);
+    const renderedLines = result.map((line) => line.map((bbox) => bbox.str).join(" "));
+
+    expect(renderedLines).toStrictEqual(["Heading", "", "First paragraph", "Second line"]);
+  });
 });
 
 describe("test projectToGrid", () => {
@@ -243,7 +280,14 @@ describe("test projectToGrid", () => {
         forwardAnchorCenter: {},
       },
     };
-    const result = projectToGrid(config, page, projectionBoxes, prevAnchors, totalPages);
+    const result = projectToGrid(
+      config,
+      page,
+      projectionBoxes,
+      prevAnchors,
+      totalPages,
+      NOOP_LOGGER
+    );
     expect(result).toStrictEqual(expectedOutput);
   });
 
@@ -275,7 +319,14 @@ describe("test projectToGrid", () => {
       text: " Name      Age\n Alice     30",
       prevAnchors: prevAnchors,
     };
-    const result = projectToGrid(config, page, projectionBoxes, prevAnchors, totalPages);
+    const result = projectToGrid(
+      config,
+      page,
+      projectionBoxes,
+      prevAnchors,
+      totalPages,
+      NOOP_LOGGER
+    );
     expect(result).toStrictEqual(expectedOutput);
   });
 
@@ -299,7 +350,14 @@ describe("test projectToGrid", () => {
       text: " Revenue    500",
       prevAnchors: prevAnchors,
     };
-    const result = projectToGrid(config, page, projectionBoxes, prevAnchors, totalPages);
+    const result = projectToGrid(
+      config,
+      page,
+      projectionBoxes,
+      prevAnchors,
+      totalPages,
+      NOOP_LOGGER
+    );
     expect(result).toStrictEqual(expectedOutput);
   });
 });
@@ -400,7 +458,7 @@ const mockPageData = [
 ];
 
 describe("test projectPagesToGrid", () => {
-  it("test pages projection", () => {
+  it("test pages projection", async () => {
     const config = { ...DEFAULT_CONFIG, preserveLayoutAlignmentAcrossPages: false };
     const expectedOutput = [
       {
@@ -479,7 +537,7 @@ describe("test projectPagesToGrid", () => {
         boundingBoxes: [],
       },
     ];
-    const result = projectPagesToGrid(mockPageData, config);
+    const result = await projectPagesToGrid(mockPageData, config);
     expect(result).toStrictEqual(expectedOutput);
   });
 });

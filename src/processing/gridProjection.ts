@@ -5,11 +5,35 @@ import { ProjectionTextBox, Coordinates, LiteParseConfig, ParsedPage } from "../
 import { PageData } from "../engines/pdf/interface.js";
 
 import { applyMarkupTags } from "./markupUtils.js";
+import { GridDebugLogger, createGridDebugLogger } from "./gridDebugLogger.js";
+import { renderAllVisualizations } from "./gridVisualizer.js";
 
 // Minimum spaces between unsnapped bboxes (likely justified text
 const FLOATING_SPACES = 2;
 // Minimum spaces between snapped columns
 const COLUMN_SPACES = 4;
+
+// --- Flowing text detection thresholds ---
+// Max total anchors (left+right+center) before block is considered structured
+const FLOWING_MAX_TOTAL_ANCHORS = 4;
+// Max left anchors before block is considered structured
+const FLOWING_MAX_LEFT_ANCHORS = 3;
+// Minimum non-empty lines required to classify a block
+const FLOWING_MIN_LINES = 3;
+// Fraction of page width a line must span to count as "wide"
+const FLOWING_WIDE_LINE_RATIO = 0.5;
+// Fraction of lines that must be wide for a block to be flowing
+const FLOWING_WIDE_LINE_THRESHOLD = 0.6;
+// Multiplier on median char width for column gap detection
+const FLOWING_COLUMN_GAP_MULTIPLIER = 4;
+// Minimum items on a line to be classified as flowing in per-line detection
+const FLOWING_MIN_LINE_ITEMS = 3;
+// Height multiplier for word-break space threshold in flowing text
+const FLOWING_SPACE_HEIGHT_RATIO = 0.15;
+// Minimum absolute space threshold in flowing text
+const FLOWING_SPACE_MIN_THRESHOLD = 0.3;
+// Maximum indent (in character widths) for flowing text
+const FLOWING_MAX_INDENT = 8;
 
 type Snap = {
   bbox: ProjectionTextBox;
@@ -59,9 +83,33 @@ type TextBoxSize = {
   height: number;
 };
 
+type LineMetrics = {
+  top: number;
+  bottom: number;
+  height: number;
+};
+
 function roundAnchor(anchor: number): number {
   // group anchor x-coord by nearest 1/4 unit
   return Math.round(anchor * 4) / 4;
+}
+
+function getRepresentativeLineMetrics(
+  line: ProjectionTextBox[],
+  globalMedianHeight: number
+): LineMetrics {
+  const minRepresentativeHeight = globalMedianHeight * 0.5;
+  const representativeItems = line.filter((bbox) => bbox.h >= minRepresentativeHeight);
+  const items = representativeItems.length > 0 ? representativeItems : line;
+
+  const top = Math.min(...items.map((bbox) => bbox.y));
+  const bottom = Math.max(...items.map((bbox) => bbox.y + bbox.h));
+
+  return {
+    top,
+    bottom,
+    height: bottom - top,
+  };
 }
 
 // 2pt @ PDF 72 DPI -> 8px @ 300DPI
@@ -427,15 +475,21 @@ function extractAnchorsPointsFromLines(lines: ProjectionTextBox[][], page: PageD
         if (item.rightAnchor) {
           const key = parseFloat(item.rightAnchor);
           if (anchorRight[key]) {
-            anchorRight[key].splice(anchorRight[key].indexOf(item), 1);
-            hasChanged = true;
+            const idx = anchorRight[key].indexOf(item);
+            if (idx >= 0) {
+              anchorRight[key].splice(idx, 1);
+              hasChanged = true;
+            }
           }
         }
         if (item.centerAnchor) {
           const key = parseFloat(item.centerAnchor);
           if (anchorCenter[key]) {
-            anchorCenter[key].splice(anchorCenter[key].indexOf(item), 1);
-            hasChanged = true;
+            const idx = anchorCenter[key].indexOf(item);
+            if (idx >= 0) {
+              anchorCenter[key].splice(idx, 1);
+              hasChanged = true;
+            }
           }
         }
         duplicates.splice(i, 1);
@@ -465,8 +519,11 @@ function extractAnchorsPointsFromLines(lines: ProjectionTextBox[][], page: PageD
         if (item.centerAnchor) {
           const key = parseFloat(item.centerAnchor);
           if (anchorCenter[key]) {
-            anchorCenter[key].splice(anchorCenter[key].indexOf(item), 1);
-            hasChanged = true;
+            const idx = anchorCenter[key].indexOf(item);
+            if (idx >= 0) {
+              anchorCenter[key].splice(idx, 1);
+              hasChanged = true;
+            }
           }
         }
         duplicates.splice(i, 1);
@@ -480,13 +537,19 @@ function extractAnchorsPointsFromLines(lines: ProjectionTextBox[][], page: PageD
     if (item.leftAnchor) {
       const key = parseFloat(item.leftAnchor);
       if (anchorLeft[key]) {
-        anchorLeft[key].splice(anchorLeft[key].indexOf(item), 1);
+        const idx = anchorLeft[key].indexOf(item);
+        if (idx >= 0) {
+          anchorLeft[key].splice(idx, 1);
+        }
       }
     }
     if (item.rightAnchor) {
       const key = parseFloat(item.rightAnchor);
       if (anchorRight[key]) {
-        anchorRight[key].splice(anchorRight[key].indexOf(item), 1);
+        const idx = anchorRight[key].indexOf(item);
+        if (idx >= 0) {
+          anchorRight[key].splice(idx, 1);
+        }
       }
     }
   }
@@ -765,9 +828,17 @@ export function bboxToLine(
 
   function canMerge(previousBbox: ProjectionTextBox, bbox: ProjectionTextBox): boolean {
     if (bbox.y == previousBbox.y && bbox.h == previousBbox.h) {
-      const xDelta = bbox.x - previousBbox.x - previousBbox.w;
+      // Use raw pageBbox width for sub-pixel accurate gap calculation.
+      // The rounded `.w` field can cause a true −0.02px overlap to appear as +0.12px,
+      // and a −0.86px overlap to appear as −0.72px — both outside the old tolerance.
+      // PDFs sometimes encode a single value (e.g. "119:12") as a sequence of adjacent
+      // text runs whose bounding boxes touch or slightly overlap (up to ~1px) due to
+      // character spacing / kerning. We must merge these rather than treat them as
+      // separate tokens.
+      const prevRawWidth = previousBbox.pageBbox?.w ?? previousBbox.w;
+      const xDelta = bbox.x - previousBbox.x - prevRawWidth;
       if (
-        ((xDelta < 0 && xDelta > -0.5) || (xDelta >= 0 && xDelta < 0.1)) &&
+        ((xDelta < 0 && xDelta > -1.0) || (xDelta >= 0 && xDelta < 0.1)) &&
         canMergeMarkup(previousBbox, bbox)
       ) {
         return true;
@@ -823,8 +894,14 @@ export function bboxToLine(
         // - character spacing/kerning
         // - floating-point precision issues
         // - adjacent items with slightly overlapping bounding boxes
-        // We want to detect true collisions (same text rendered twice) not adjacent text
-        if (overlapLenght > Math.max(medianWidth / 3, 5)) {
+        // We want to detect true collisions (same text rendered twice) not adjacent text.
+        // Some PDFs (e.g. scanned documents with text overlays) split lines into narrow
+        // vertical strips whose bounding boxes overlap by a few pixels. These are NOT
+        // duplicates — they contain different text fragments. True duplicates overlap by
+        // close to 100% of the item width. Use a proportional check: only treat as
+        // collision if overlap exceeds 50% of the smaller item's width.
+        const minItemWidth = Math.min(currentLineItemBbox.w, bbox.w);
+        if (overlapLenght > Math.max(medianWidth / 3, 5) && overlapLenght > minItemWidth * 0.5) {
           lineCollide = true;
           break;
         }
@@ -895,7 +972,14 @@ export function bboxToLine(
         const bothAreNumbers =
           looksLikeTableNumber(previousLine.str) && looksLikeTableNumber(currentLine.str);
 
-        if (!bothAreNumbers && currentLine.x - previousLine.x - previousLine.w <= mergeThreshold) {
+        // Check gap with BOTH rounded width (used elsewhere) and raw width from pageBbox.
+        // Only merge without space if both agree the gap is small enough. This prevents
+        // rounding artifacts from causing word fusions (e.g., "of" + "our" → "ofour"
+        // when Math.round(w) reduces the gap from 1.34 to 1.0)
+        const roundedGap = currentLine.x - previousLine.x - previousLine.w;
+        const rawGap =
+          currentLine.x - previousLine.x - (previousLine.pageBbox?.w ?? previousLine.w);
+        if (!bothAreNumbers && roundedGap <= mergeThreshold && rawGap <= mergeThreshold) {
           // if same word but less than .7 of prev line
           if (currentLine.h != 0 && currentLine.h < previousLine.h * 0.7) {
             // and not starting with space
@@ -908,9 +992,47 @@ export function bboxToLine(
               currentLine.str = strToPostScript(currentLine.str);
             }
           }
+
+          // When items overlap (negative gap), the overlap zone often contains
+          // duplicated characters (common in strip-fragmented PDFs from scans).
+          // Detect and strip the overlapping characters to avoid doubled text.
+          // Try multiple overlap estimates (floor/ceil with both char widths) since
+          // average character width is approximate and rounding can be off by one.
+          let textToAppend = currentLine.str;
+          let lengthToAdd = currentLine.strLength;
+          if (roundedGap < 0) {
+            const prevCharWidth =
+              previousLine.strLength > 0 ? previousLine.w / previousLine.strLength : 1;
+            const currCharWidth =
+              currentLine.strLength > 0 ? currentLine.w / currentLine.strLength : 1;
+            const rawOverlap = -roundedGap;
+            // Generate candidate overlap counts from both char widths, floored and ceiled
+            const candidates = new Set([
+              Math.floor(rawOverlap / prevCharWidth),
+              Math.ceil(rawOverlap / prevCharWidth),
+              Math.floor(rawOverlap / currCharWidth),
+              Math.ceil(rawOverlap / currCharWidth),
+            ]);
+            for (const overlapChars of candidates) {
+              if (
+                overlapChars > 0 &&
+                overlapChars < currentLine.strLength &&
+                overlapChars <= previousLine.strLength
+              ) {
+                const prevEnd = previousLine.str.slice(-overlapChars).toLowerCase();
+                const currStart = currentLine.str.slice(0, overlapChars).toLowerCase();
+                if (prevEnd === currStart) {
+                  textToAppend = currentLine.str.slice(overlapChars);
+                  lengthToAdd = currentLine.strLength - overlapChars;
+                  break;
+                }
+              }
+            }
+          }
+
           previousLine.w = currentLine.x + currentLine.w - previousLine.x;
-          previousLine.str += currentLine.str;
-          previousLine.strLength += currentLine.strLength;
+          previousLine.str += textToAppend;
+          previousLine.strLength += lengthToAdd;
           previousLine.pageBbox = mergePageBbox(previousLine, currentLine);
           line.splice(i, 1);
           i--;
@@ -978,13 +1100,20 @@ export function bboxToLine(
   }
 
   for (let i = 1; i < lines.length; i++) {
-    const yDelta = lines[i][0].y - lines[i - 1][0].y - lines[i - 1][0].h;
+    const previousLineMetrics = getRepresentativeLineMetrics(lines[i - 1], medianHeight);
+    const currentLineMetrics = getRepresentativeLineMetrics(lines[i], medianHeight);
+    const yDelta = currentLineMetrics.top - previousLineMetrics.bottom;
+    const referenceHeight = Math.max(
+      medianHeight,
+      Math.min(previousLineMetrics.height, currentLineMetrics.height)
+    );
+
     // Calculate the number of blank lines to insert based on vertical spacing
     // Use medianHeight as a reference for one line spacing
-    if (yDelta > medianHeight) {
+    if (yDelta > referenceHeight) {
       // Calculate how many blank lines should be inserted
       // Round to nearest integer to get approximate number of lines
-      const numBlankLines = Math.round(yDelta / medianHeight) - 1;
+      const numBlankLines = Math.round(yDelta / referenceHeight) - 1;
       // Cap at a reasonable maximum (e.g., 10 blank lines) to avoid extreme cases
       const linesToInsert = Math.min(Math.max(numBlankLines, 1), 10);
 
@@ -1013,7 +1142,11 @@ function updateForwardAnchorRightBound(
   snapMap: number[],
   forwardAnchor: ForwardAnchor,
   rightBound: number,
-  anchorTarget: number
+  anchorTarget: number,
+  logger: GridDebugLogger,
+  triggerText: string,
+  triggerLineIndex: number,
+  snapType: string
 ): void {
   // Anything snapped to the right of rightBound should be aligned to anchorTarget line length at minimum
   // Also update nearby positions (within tolerance) to handle slight position variations between rows
@@ -1023,14 +1156,34 @@ function updateForwardAnchorRightBound(
     const anchor = snapMap[i];
     if (rightBound <= anchor) {
       if (!forwardAnchor[anchor] || anchorTarget > forwardAnchor[anchor]) {
+        const oldValue = forwardAnchor[anchor];
         forwardAnchor[anchor] = anchorTarget;
+        logger.logForwardAnchorMutation(
+          triggerText,
+          triggerLineIndex,
+          snapType,
+          anchor,
+          oldValue,
+          anchorTarget,
+          rightBound
+        );
       }
       // Also update nearby positions within tolerance
       for (let j = i - 1; j >= 0; --j) {
         const nearbyAnchor = snapMap[j];
         if (anchor - nearbyAnchor > POSITION_TOLERANCE) break;
         if (!forwardAnchor[nearbyAnchor] || anchorTarget > forwardAnchor[nearbyAnchor]) {
+          const oldValue = forwardAnchor[nearbyAnchor];
           forwardAnchor[nearbyAnchor] = anchorTarget;
+          logger.logForwardAnchorMutation(
+            triggerText,
+            triggerLineIndex,
+            snapType,
+            nearbyAnchor,
+            oldValue,
+            anchorTarget,
+            rightBound
+          );
         }
       }
     } else {
@@ -1044,22 +1197,164 @@ function updateForwardAnchors(
   nextBbox: ProjectionTextBox | null,
   snapMaps: SnapMaps,
   forwardAnchors: PageForwardAnchors,
-  lineLength: number
+  lineLength: number,
+  logger: GridDebugLogger,
+  lineIndex: number
 ): void {
   const rightBound = bbox.x + bbox.w;
   let targetLength = lineLength;
   if (nextBbox && (nextBbox.shouldSpace ?? 0) > 0) {
     targetLength += nextBbox.shouldSpace ?? 0;
   }
-  updateForwardAnchorRightBound(snapMaps.left, forwardAnchors.left, rightBound, targetLength);
-  updateForwardAnchorRightBound(snapMaps.right, forwardAnchors.right, rightBound, targetLength);
+  const triggerText = bbox.str;
+  updateForwardAnchorRightBound(
+    snapMaps.left,
+    forwardAnchors.left,
+    rightBound,
+    targetLength,
+    logger,
+    triggerText,
+    lineIndex,
+    "left"
+  );
+  updateForwardAnchorRightBound(
+    snapMaps.right,
+    forwardAnchors.right,
+    rightBound,
+    targetLength,
+    logger,
+    triggerText,
+    lineIndex,
+    "right"
+  );
+
   // we do not update center anchors since centered text may span between snapped columns
   updateForwardAnchorRightBound(
     snapMaps.floating,
     forwardAnchors.floating,
     rightBound,
-    targetLength
+    targetLength,
+    logger,
+    triggerText,
+    lineIndex,
+    "floating"
   );
+}
+
+/**
+ * Compute the maximum gap between adjacent items on a line.
+ */
+function lineMaxGap(line: ProjectionTextBox[]): number {
+  let maxGap = 0;
+  for (let gi = 1; gi < line.length; gi++) {
+    const gap = line[gi].x - (line[gi - 1].x + line[gi - 1].w);
+    if (gap > maxGap) maxGap = gap;
+  }
+  return maxGap;
+}
+
+/**
+ * Render a single line as flowing text: join items with single spaces based on gap size.
+ * Sets bbox.rendered = true for each item.
+ */
+function renderLineAsFlowingText(
+  line: ProjectionTextBox[],
+  minX: number,
+  medianWidth: number
+): string {
+  const indent = Math.min(
+    Math.max(Math.round((line[0].x - minX) / medianWidth), 0),
+    FLOWING_MAX_INDENT
+  );
+  let result = " ".repeat(indent);
+
+  for (let i = 0; i < line.length; i++) {
+    const bbox = line[i];
+    if (i > 0) {
+      const prevBbox = line[i - 1];
+      const gap = bbox.x - (prevBbox.x + prevBbox.w);
+      const spaceThreshold = Math.max(
+        bbox.h * FLOWING_SPACE_HEIGHT_RATIO,
+        FLOWING_SPACE_MIN_THRESHOLD
+      );
+      if (gap > spaceThreshold && !result.endsWith(" ")) {
+        result += " ";
+      }
+    }
+    result += bbox.str;
+    bbox.rendered = true;
+  }
+
+  return result;
+}
+
+/**
+ * Classify whether a block of lines is flowing paragraph text or structured/tabular content.
+ * Flowing text gets a simpler rendering path that avoids grid projection artifacts.
+ */
+function isFlowingTextBlock(
+  blockLines: ProjectionTextBox[][],
+  anchorLeft: Anchor,
+  anchorRight: Anchor,
+  anchorCenter: Anchor,
+  pageWidth: number
+): boolean {
+  const leftAnchorCount = Object.keys(anchorLeft).length;
+  const rightAnchorCount = Object.keys(anchorRight).length;
+  const centerAnchorCount = Object.keys(anchorCenter).length;
+
+  // Multiple column anchors indicate structured/tabular content
+  if (leftAnchorCount + rightAnchorCount + centerAnchorCount > FLOWING_MAX_TOTAL_ANCHORS)
+    return false;
+  if (leftAnchorCount > FLOWING_MAX_LEFT_ANCHORS) return false;
+
+  // Count non-empty lines and how many span most of the page width
+  let nonEmptyLines = 0;
+  let wideLines = 0;
+  for (const line of blockLines) {
+    if (line.length === 0) continue;
+    nonEmptyLines++;
+    const lineStart = line[0].x;
+    const lineEnd = line[line.length - 1].x + line[line.length - 1].w;
+    if (lineEnd - lineStart > pageWidth * FLOWING_WIDE_LINE_RATIO) wideLines++;
+  }
+
+  // Need enough lines to confidently classify
+  if (nonEmptyLines < FLOWING_MIN_LINES) return false;
+
+  // Majority of lines should span most of page width for flowing text
+  return wideLines / nonEmptyLines > FLOWING_WIDE_LINE_THRESHOLD;
+}
+
+/**
+ * Render a flowing text block by joining items with single spaces.
+ * Avoids grid projection artifacts (excessive whitespace, fused words)
+ * that occur when applying column-alignment logic to paragraph text.
+ */
+function renderFlowingBlock(
+  lines: ProjectionTextBox[][],
+  block: LineRange,
+  rawLines: string[],
+  medianWidth: number
+): void {
+  // Find the block's left margin
+  let minX = Infinity;
+  for (let i = block.start; i < block.end; i++) {
+    if (lines[i].length > 0) {
+      minX = Math.min(minX, lines[i][0].x);
+    }
+  }
+  if (minX === Infinity) minX = 0;
+
+  for (let lineIndex = block.start; lineIndex < block.end; lineIndex++) {
+    const line = lines[lineIndex];
+    if (!rawLines[lineIndex]) {
+      rawLines[lineIndex] = "";
+    }
+    if (line.length === 0) continue;
+
+    rawLines[lineIndex] = renderLineAsFlowingText(line, minX, medianWidth);
+  }
 }
 
 function getMedianTextBoxSize(lines: ProjectionTextBox[]): TextBoxSize {
@@ -1088,7 +1383,8 @@ export function projectToGrid(
   page: PageData,
   projectionBoxes: ProjectionTextBox[],
   prevAnchors: PrevAnchors,
-  totalPages: number
+  totalPages: number,
+  logger: GridDebugLogger
 ): { text: string; prevAnchors: PrevAnchors } {
   // detect '.' garbage in the lines
   let dotCount = 0;
@@ -1141,6 +1437,11 @@ export function projectToGrid(
 
   handleRotationReadingOrder(projectionBoxes, page.height);
   const lines = bboxToLine(projectionBoxes, medianWidth, medianHeight, page.width);
+
+  // Log line composition
+  for (let i = 0; i < lines.length; i++) {
+    logger.logLineComposition(i, lines[i]);
+  }
 
   // remove unprojectable text and apply markup to final lines
   for (let i = 0; i < lines.length; ++i) {
@@ -1197,11 +1498,36 @@ export function projectToGrid(
     }
   }
 
+  // Log block assignments
+  for (let bi = 0; bi < blocks.length; bi++) {
+    logger.logBlock(bi, blocks[bi].start, blocks[bi].end);
+  }
+
   for (const block of blocks) {
+    const blockLines = lines.slice(block.start, block.end);
     const { anchorLeft, anchorRight, anchorCenter } = extractAnchorsPointsFromLines(
-      lines.slice(block.start, block.end),
+      blockLines,
       page
     );
+
+    logger.logAnchors(anchorLeft, anchorRight, anchorCenter);
+
+    // Block-level classification: if entire block is clearly flowing text,
+    // render it simply and skip grid projection
+    if (isFlowingTextBlock(blockLines, anchorLeft, anchorRight, anchorCenter, page.width)) {
+      logger.logFlowingBlock(block.start, block.end);
+      if (!config.preserveLayoutAlignmentAcrossPages) {
+        const sizes = getMedianTextBoxSize(blockLines.flat());
+        medianWidth = sizes.width;
+      }
+      renderFlowingBlock(lines, block, rawLines, medianWidth);
+      for (let li = block.start; li < block.end; li++) {
+        if (rawLines[li]) logger.captureRender(li, 0, rawLines[li], "flowing");
+      }
+      continue;
+    }
+
+    logger.logStructuredBlock(block.start, block.end);
 
     const snapMaps: SnapMaps = {
       left: [],
@@ -1241,6 +1567,8 @@ export function projectToGrid(
       // medianHeight updated but not currently used per-block - reserved for future use
       void sizes.height;
     }
+
+    logger.logBlockContext(block.start, block.end, medianWidth, new Set());
 
     // compute snaps
     for (let lineIndex = block.start; lineIndex < block.end; ++lineIndex) {
@@ -1294,6 +1622,7 @@ export function projectToGrid(
         }
 
         prevBbox = bbox;
+        logger.logSnapAssignment(bbox, lineIndex, boxIndex);
         if (!bbox.snap) {
           uniqueSnaps.add(Math.round(bbox.x));
         } else if (bbox.snap == "left") {
@@ -1313,6 +1642,74 @@ export function projectToGrid(
     snapMaps.center.sort((a, b) => a - b);
     snapMaps.right.sort((a, b) => a - b);
     snapMaps.left.sort((a, b) => a - b);
+
+    // Per-line flowing text detection: pre-render lines that are clearly paragraph text
+    // (spans page width, no large column gaps) with simple single-space joining.
+    // This avoids grid projection artifacts on flowing text within mixed blocks.
+    const flowingLines = new Set<number>();
+    {
+      // Find block's left margin for indent calculation
+      let blockMinX = Infinity;
+      for (let li = block.start; li < block.end; li++) {
+        if (lines[li].length > 0) {
+          blockMinX = Math.min(blockMinX, lines[li][0].x);
+        }
+      }
+      if (blockMinX === Infinity) blockMinX = 0;
+
+      const columnGapThreshold = medianWidth * FLOWING_COLUMN_GAP_MULTIPLIER;
+
+      // Helper to mark and render a line as flowing
+      function markFlowing(lineIndex: number, reason: string): void {
+        const line = lines[lineIndex];
+        if (!rawLines[lineIndex]) {
+          rawLines[lineIndex] = "";
+          rawLinesDelta[lineIndex] = 0;
+        }
+        rawLines[lineIndex] = renderLineAsFlowingText(line, blockMinX, medianWidth);
+        flowingLines.add(lineIndex);
+        logger.logFlowingLine(lineIndex, reason);
+        logger.captureRender(lineIndex, 0, rawLines[lineIndex], "flowing");
+      }
+
+      // First pass: detect clearly flowing lines (wide, no column gaps, enough items)
+      for (let lineIndex = block.start; lineIndex < block.end; lineIndex++) {
+        const line = lines[lineIndex];
+        if (line.length < FLOWING_MIN_LINE_ITEMS) continue;
+
+        const lineStart = line[0].x;
+        const lineEnd = line[line.length - 1].x + line[line.length - 1].w;
+        const lineSpan = lineEnd - lineStart;
+
+        if (
+          lineSpan > page.width * FLOWING_WIDE_LINE_RATIO &&
+          lineMaxGap(line) < columnGapThreshold
+        ) {
+          markFlowing(lineIndex, "wide span, no column gaps");
+        }
+      }
+
+      // Second pass: extend flowing to adjacent continuation lines using
+      // forward + backward sweeps (O(n) instead of iterating until convergence)
+      // Forward sweep: propagate flowing status downward
+      for (let lineIndex = block.start; lineIndex < block.end; lineIndex++) {
+        if (flowingLines.has(lineIndex)) continue;
+        const line = lines[lineIndex];
+        if (line.length === 0) continue;
+        if (flowingLines.has(lineIndex - 1) && lineMaxGap(line) < columnGapThreshold) {
+          markFlowing(lineIndex, `forward propagation from line ${lineIndex - 1}`);
+        }
+      }
+      // Backward sweep: propagate flowing status upward
+      for (let lineIndex = block.end - 1; lineIndex >= block.start; lineIndex--) {
+        if (flowingLines.has(lineIndex)) continue;
+        const line = lines[lineIndex];
+        if (line.length === 0) continue;
+        if (flowingLines.has(lineIndex + 1) && lineMaxGap(line) < columnGapThreshold) {
+          markFlowing(lineIndex, `backward propagation from line ${lineIndex + 1}`);
+        }
+      }
+    }
 
     while (hasChanged || snapMaps.right.length || snapMaps.left.length || snapMaps.center.length) {
       hasChanged = false;
@@ -1348,23 +1745,32 @@ export function projectToGrid(
             break;
           }
 
-          let targetX = Math.min(Math.round(bbox.x / medianWidth), COLUMN_SPACES);
+          const initialTargetX = Math.round(bbox.x / medianWidth);
+          let targetX = Math.min(initialTargetX, COLUMN_SPACES);
 
           let lastSnapLeft = 0;
+          let lastSnapLeftKey: number | undefined;
           for (const key in forwardAnchors.left) {
             // Use parseFloat to preserve decimal precision from anchor keys
             if (parseFloat(key) <= bbox.x) {
-              lastSnapLeft = Math.max(lastSnapLeft, forwardAnchors.left[key]);
+              if (forwardAnchors.left[key] > lastSnapLeft) {
+                lastSnapLeft = forwardAnchors.left[key];
+                lastSnapLeftKey = parseFloat(key);
+              }
             }
           }
-          const lineMax = Math.max(
-            lastSnapLeft,
-            rawLines[lineIndex].trimEnd().length + (bbox.shouldSpace ?? 0)
-          );
+          const rawLineTrimLength = rawLines[lineIndex].trimEnd().length;
+          const lineMax = Math.max(lastSnapLeft, rawLineTrimLength + (bbox.shouldSpace ?? 0));
+          let bindingConstraint = "COLUMN_SPACES";
           if (targetX < lineMax) {
             targetX = lineMax;
+            bindingConstraint =
+              lastSnapLeft >= rawLineTrimLength + (bbox.shouldSpace ?? 0)
+                ? "lastSnapLeft"
+                : "lineMax";
           }
 
+          let floatingAnchorBump: number | undefined;
           if (!bbox.forceUnsnapped) {
             const floatingAnchor = forwardAnchors.floating[Math.round(bbox.x)];
             if (floatingAnchor && targetX < floatingAnchor) {
@@ -1373,10 +1779,26 @@ export function projectToGrid(
               const maxFloatingGap = 4;
               const adjustedAnchor = Math.min(floatingAnchor, targetX + maxFloatingGap);
               if (adjustedAnchor > targetX) {
+                floatingAnchorBump = adjustedAnchor - targetX;
                 targetX = adjustedAnchor;
+                bindingConstraint = "floatingAnchor";
               }
             }
           }
+
+          logger.logRenderTrace(bbox, lineIndex, {
+            snapType: "floating",
+            initialTargetX,
+            medianWidth,
+            lineMax,
+            lastSnapLeft: lastSnapLeft > 0 ? lastSnapLeft : undefined,
+            lastSnapLeftKey,
+            rawLineTrimLength,
+            shouldSpace: bbox.shouldSpace ?? 0,
+            floatingAnchorBump,
+            finalTargetX: targetX,
+            bindingConstraint,
+          });
 
           rawLines[lineIndex] = rawLines[lineIndex].trimEnd();
           if (targetX > rawLines[lineIndex].length) {
@@ -1387,6 +1809,8 @@ export function projectToGrid(
 
           bbox.rendered = true;
           hasChanged = true;
+          logger.logRender(bbox, lineIndex, targetX, "floating");
+          logger.captureRender(lineIndex, targetX, bbox.str, "floating");
 
           let nextBbox: ProjectionTextBox | null = null;
           if (line.length > boxIndex + 1) {
@@ -1398,7 +1822,9 @@ export function projectToGrid(
               nextBbox,
               snapMaps,
               forwardAnchors,
-              rawLines[lineIndex].length
+              rawLines[lineIndex].length,
+              logger,
+              lineIndex
             );
           }
         }
@@ -1411,7 +1837,11 @@ export function projectToGrid(
       ) {
         const thisTurnSnap: Snap[] = [];
         for (const item of leftSnap) {
-          if (item.bbox.leftAnchor && parseFloat(item.bbox.leftAnchor) == snapMaps.left[0]) {
+          if (
+            item.bbox.leftAnchor &&
+            parseFloat(item.bbox.leftAnchor) == snapMaps.left[0] &&
+            !flowingLines.has(item.lineIndex)
+          ) {
             thisTurnSnap.push(item);
           }
         }
@@ -1421,7 +1851,8 @@ export function projectToGrid(
           continue;
         }
 
-        let targetX = Math.min(Math.round(snapMaps.left[0] / medianWidth), COLUMN_SPACES);
+        const leftInitialTargetX = Math.round(snapMaps.left[0] / medianWidth);
+        let targetX = Math.min(leftInitialTargetX, COLUMN_SPACES);
         const lineMax = Math.max(
           ...thisTurnSnap.map((v) => {
             let spaceEnd = 0;
@@ -1440,32 +1871,50 @@ export function projectToGrid(
           })
         );
 
+        let leftBindingConstraint = "COLUMN_SPACES";
         if (targetX < lineMax) {
           targetX = lineMax;
+          leftBindingConstraint = "lineMax";
         }
 
-        if (
-          forwardAnchors.left[snapMaps.left[0]] &&
-          targetX < forwardAnchors.left[snapMaps.left[0]]
-        ) {
-          targetX = forwardAnchors.left[snapMaps.left[0]];
+        const leftForwardAnchorValue = forwardAnchors.left[snapMaps.left[0]];
+        if (leftForwardAnchorValue && targetX < leftForwardAnchorValue) {
+          targetX = leftForwardAnchorValue;
+          leftBindingConstraint = "forwardAnchor";
         }
-        if (
-          prevAnchors.forwardAnchorLeft[snapMaps.left[0]] &&
-          targetX < prevAnchors.forwardAnchorLeft[snapMaps.left[0]]
-        ) {
-          targetX = prevAnchors.forwardAnchorLeft[snapMaps.left[0]];
+        const leftPrevAnchorValue = prevAnchors.forwardAnchorLeft[snapMaps.left[0]];
+        if (leftPrevAnchorValue && targetX < leftPrevAnchorValue) {
+          targetX = leftPrevAnchorValue;
+          leftBindingConstraint = "prevAnchor";
         }
 
         forwardAnchors.left[snapMaps.left[0]] = targetX;
+        logger.logForwardAnchor("left", snapMaps.left[0], targetX);
 
         for (const currentLeftSnapBox of thisTurnSnap) {
           const lineIndex = currentLeftSnapBox.lineIndex;
+          if (flowingLines.has(lineIndex)) continue;
+
+          logger.logRenderTrace(currentLeftSnapBox.bbox, lineIndex, {
+            snapType: "left",
+            initialTargetX: leftInitialTargetX,
+            medianWidth,
+            lineMax,
+            rawLineTrimLength: rawLines[lineIndex].trimEnd().length,
+            shouldSpace: currentLeftSnapBox.bbox.shouldSpace ?? 0,
+            forwardAnchorValue: leftForwardAnchorValue || undefined,
+            prevAnchorValue: leftPrevAnchorValue || undefined,
+            finalTargetX: targetX,
+            bindingConstraint: leftBindingConstraint,
+          });
+
           if (targetX > rawLines[lineIndex].length) {
             rawLines[lineIndex] += " ".repeat(targetX - rawLines[lineIndex].length);
           }
           rawLines[lineIndex] += currentLeftSnapBox.bbox.str;
           currentLeftSnapBox.bbox.rendered = true;
+          logger.logRender(currentLeftSnapBox.bbox, lineIndex, targetX, "left-snap");
+          logger.captureRender(lineIndex, targetX, currentLeftSnapBox.bbox.str, "left");
 
           let nextBbox: ProjectionTextBox | null = null;
           if (lines[lineIndex].length > currentLeftSnapBox.boxIndex + 1) {
@@ -1476,11 +1925,14 @@ export function projectToGrid(
             nextBbox,
             snapMaps,
             forwardAnchors,
-            rawLines[lineIndex].length
+            rawLines[lineIndex].length,
+            logger,
+            lineIndex
           );
         }
 
         for (let index = block.start; index < block.end; ++index) {
+          if (flowingLines.has(index)) continue;
           const line = rawLines[index];
           if (line.length < targetX) {
             rawLines[index] += " ".repeat(targetX - line.length);
@@ -1495,7 +1947,11 @@ export function projectToGrid(
         const thisTurnSnap: Snap[] = [];
         hasChanged = true;
         for (const item of rightSnap) {
-          if (item.bbox.rightAnchor && parseFloat(item.bbox.rightAnchor) == snapMaps.right[0]) {
+          if (
+            item.bbox.rightAnchor &&
+            parseFloat(item.bbox.rightAnchor) == snapMaps.right[0] &&
+            !flowingLines.has(item.lineIndex)
+          ) {
             thisTurnSnap.push(item);
           }
         }
@@ -1505,43 +1961,66 @@ export function projectToGrid(
           continue;
         }
 
-        let targetX = Math.min(Math.round(snapMaps.right[0] / medianWidth), COLUMN_SPACES);
-        const lineMax = Math.max(
-          ...thisTurnSnap.map((v) => {
-            let lastSnapLeft = 0;
-            for (const key in forwardAnchors.left) {
-              if (parseInt(key) <= v.bbox.x) {
-                lastSnapLeft = Math.max(lastSnapLeft, forwardAnchors.left[key]);
-              }
+        const rightInitialTargetX = Math.round(snapMaps.right[0] / medianWidth);
+        let targetX = Math.min(rightInitialTargetX, COLUMN_SPACES);
+        const allRightCandidates = thisTurnSnap.map((v) => {
+          let lastSnapLeft = 0;
+          for (const key in forwardAnchors.left) {
+            if (parseInt(key) <= v.bbox.x) {
+              lastSnapLeft = Math.max(lastSnapLeft, forwardAnchors.left[key]);
             }
-            return (
-              Math.max(
-                lastSnapLeft,
-                rawLines[v.lineIndex].trimEnd().length + (v.bbox.shouldSpace ?? 0)
-              ) + v.bbox.strLength
-            );
-          })
-        );
+          }
+          const value =
+            Math.max(
+              lastSnapLeft,
+              rawLines[v.lineIndex].trimEnd().length + (v.bbox.shouldSpace ?? 0)
+            ) + v.bbox.strLength;
+          return {
+            text: v.bbox.str.substring(0, 30),
+            lineIndex: v.lineIndex,
+            lineItemCount: lines[v.lineIndex].length,
+            filtered: false,
+            value,
+          };
+        });
+        const lineMax = Math.max(...allRightCandidates.map((c) => c.value));
 
+        let rightBindingConstraint = "COLUMN_SPACES";
         if (targetX < lineMax) {
           targetX = lineMax;
+          rightBindingConstraint = "lineMax";
         }
-        if (
-          forwardAnchors.right[snapMaps.right[0]] &&
-          targetX < forwardAnchors.right[snapMaps.right[0]]
-        ) {
-          targetX = forwardAnchors.right[snapMaps.right[0]];
+        const rightForwardAnchorValue = forwardAnchors.right[snapMaps.right[0]];
+        if (rightForwardAnchorValue && targetX < rightForwardAnchorValue) {
+          targetX = rightForwardAnchorValue;
+          rightBindingConstraint = "forwardAnchor";
         }
-        if (
-          prevAnchors.forwardAnchorRight[snapMaps.right[0]] &&
-          targetX < prevAnchors.forwardAnchorRight[snapMaps.right[0]]
-        ) {
-          targetX = prevAnchors.forwardAnchorRight[snapMaps.right[0]];
+        const rightPrevAnchorValue = prevAnchors.forwardAnchorRight[snapMaps.right[0]];
+        if (rightPrevAnchorValue && targetX < rightPrevAnchorValue) {
+          targetX = rightPrevAnchorValue;
+          rightBindingConstraint = "prevAnchor";
         }
         forwardAnchors.right[snapMaps.right[0]] = targetX;
+        logger.logForwardAnchor("right", snapMaps.right[0], targetX);
 
         for (const currentRightSnapBox of thisTurnSnap) {
           const lineIndex = currentRightSnapBox.lineIndex;
+          if (flowingLines.has(lineIndex)) continue;
+
+          logger.logRenderTrace(currentRightSnapBox.bbox, lineIndex, {
+            snapType: "right",
+            initialTargetX: rightInitialTargetX,
+            medianWidth,
+            lineMax,
+            rawLineTrimLength: rawLines[lineIndex].trimEnd().length,
+            shouldSpace: currentRightSnapBox.bbox.shouldSpace ?? 0,
+            lineMaxCandidates: allRightCandidates,
+            forwardAnchorValue: rightForwardAnchorValue || undefined,
+            prevAnchorValue: rightPrevAnchorValue || undefined,
+            finalTargetX: targetX,
+            bindingConstraint: rightBindingConstraint,
+          });
+
           rawLines[lineIndex] = rawLines[lineIndex].trimEnd();
           if (targetX > rawLines[lineIndex].trimEnd().length + currentRightSnapBox.bbox.strLength) {
             rawLines[lineIndex] += " ".repeat(
@@ -1550,6 +2029,13 @@ export function projectToGrid(
           }
           rawLines[lineIndex] += currentRightSnapBox.bbox.str;
           currentRightSnapBox.bbox.rendered = true;
+          logger.logRender(currentRightSnapBox.bbox, lineIndex, targetX, "right-snap");
+          logger.captureRender(
+            lineIndex,
+            targetX - currentRightSnapBox.bbox.strLength,
+            currentRightSnapBox.bbox.str,
+            "right"
+          );
 
           let nextBbox: ProjectionTextBox | null = null;
           if (lines[lineIndex].length > currentRightSnapBox.boxIndex + 1) {
@@ -1560,10 +2046,13 @@ export function projectToGrid(
             nextBbox,
             snapMaps,
             forwardAnchors,
-            rawLines[lineIndex].length
+            rawLines[lineIndex].length,
+            logger,
+            lineIndex
           );
         }
         for (let index = block.start; index < block.end; ++index) {
+          if (flowingLines.has(index)) continue;
           const line = rawLines[index];
           if (line.length < targetX) {
             rawLines[index] += " ".repeat(targetX - line.length);
@@ -1578,7 +2067,11 @@ export function projectToGrid(
         const thisTurnSnap: Snap[] = [];
         hasChanged = true;
         for (const item of centerSnap) {
-          if (item.bbox.centerAnchor && parseFloat(item.bbox.centerAnchor) == snapMaps.center[0]) {
+          if (
+            item.bbox.centerAnchor &&
+            parseFloat(item.bbox.centerAnchor) == snapMaps.center[0] &&
+            !flowingLines.has(item.lineIndex)
+          ) {
             thisTurnSnap.push(item);
           }
         }
@@ -1586,7 +2079,8 @@ export function projectToGrid(
           snapMaps.center.shift();
           continue;
         }
-        let targetX = Math.min(Math.round(snapMaps.center[0] / medianWidth), COLUMN_SPACES);
+        const centerInitialTargetX = Math.round(snapMaps.center[0] / medianWidth);
+        let targetX = Math.min(centerInitialTargetX, COLUMN_SPACES);
         const lineMax = Math.max(
           ...thisTurnSnap.map((v) => {
             let spaceEnd = 0;
@@ -1604,23 +2098,39 @@ export function projectToGrid(
           })
         );
 
+        let centerBindingConstraint = "COLUMN_SPACES";
         if (targetX < lineMax) {
           targetX = lineMax;
+          centerBindingConstraint = "lineMax";
         }
-        if (
-          forwardAnchors.center[snapMaps.center[0]] &&
-          targetX < forwardAnchors.center[snapMaps.center[0]]
-        ) {
-          targetX = forwardAnchors.center[snapMaps.center[0]];
+        const centerForwardAnchorValue = forwardAnchors.center[snapMaps.center[0]];
+        if (centerForwardAnchorValue && targetX < centerForwardAnchorValue) {
+          targetX = centerForwardAnchorValue;
+          centerBindingConstraint = "forwardAnchor";
         }
-        if (
-          prevAnchors.forwardAnchorCenter[snapMaps.center[0]] &&
-          targetX < prevAnchors.forwardAnchorCenter[snapMaps.center[0]]
-        ) {
-          targetX = prevAnchors.forwardAnchorCenter[snapMaps.center[0]];
+        const centerPrevAnchorValue = prevAnchors.forwardAnchorCenter[snapMaps.center[0]];
+        if (centerPrevAnchorValue && targetX < centerPrevAnchorValue) {
+          targetX = centerPrevAnchorValue;
+          centerBindingConstraint = "prevAnchor";
         }
         forwardAnchors.center[snapMaps.center[0]] = targetX;
+        logger.logForwardAnchor("center", snapMaps.center[0], targetX);
         for (const currentCenterSnapBox of thisTurnSnap) {
+          if (flowingLines.has(currentCenterSnapBox.lineIndex)) continue;
+
+          logger.logRenderTrace(currentCenterSnapBox.bbox, currentCenterSnapBox.lineIndex, {
+            snapType: "center",
+            initialTargetX: centerInitialTargetX,
+            medianWidth,
+            lineMax,
+            rawLineTrimLength: rawLines[currentCenterSnapBox.lineIndex].trimEnd().length,
+            shouldSpace: currentCenterSnapBox.bbox.shouldSpace ?? 0,
+            forwardAnchorValue: centerForwardAnchorValue || undefined,
+            prevAnchorValue: centerPrevAnchorValue || undefined,
+            finalTargetX: targetX,
+            bindingConstraint: centerBindingConstraint,
+          });
+
           if (
             targetX >
             rawLines[currentCenterSnapBox.lineIndex].length +
@@ -1634,6 +2144,18 @@ export function projectToGrid(
           }
           rawLines[currentCenterSnapBox.lineIndex] += currentCenterSnapBox.bbox.str;
           currentCenterSnapBox.bbox.rendered = true;
+          logger.logRender(
+            currentCenterSnapBox.bbox,
+            currentCenterSnapBox.lineIndex,
+            targetX,
+            "center-snap"
+          );
+          logger.captureRender(
+            currentCenterSnapBox.lineIndex,
+            targetX - Math.round(currentCenterSnapBox.bbox.strLength / 2),
+            currentCenterSnapBox.bbox.str,
+            "center"
+          );
         }
         snapMaps.center.shift();
       }
@@ -1641,6 +2163,7 @@ export function projectToGrid(
   }
 
   fixSparseBlocks(blocks, rawLines);
+  logger.captureRawLines(rawLines);
 
   const text = rawLines.join("\n");
   // OSS: Return text instead of mutating page object
@@ -1654,7 +2177,11 @@ export function projectToGrid(
   };
 }
 
-export function projectPagesToGrid(pages: PageData[], config: LiteParseConfig): ParsedPage[] {
+export async function projectPagesToGrid(
+  pages: PageData[],
+  config: LiteParseConfig
+): Promise<ParsedPage[]> {
+  const logger = createGridDebugLogger(config.debug);
   const prevAnchors: PrevAnchors = {
     forwardAnchorLeft: {},
     forwardAnchorRight: {},
@@ -1664,6 +2191,8 @@ export function projectPagesToGrid(pages: PageData[], config: LiteParseConfig): 
   const results: ParsedPage[] = [];
 
   for (const page of pages) {
+    logger.setPage(page.pageNum, page.width, page.height);
+
     // Build projection boxes from text items
     const projectionBoxes = buildBbox(page, config);
 
@@ -1673,7 +2202,8 @@ export function projectPagesToGrid(pages: PageData[], config: LiteParseConfig): 
       page,
       projectionBoxes,
       prevAnchors,
-      pages.length
+      pages.length,
+      logger
     );
 
     // Update forward anchors if preserving across pages
@@ -1702,6 +2232,18 @@ export function projectPagesToGrid(pages: PageData[], config: LiteParseConfig): 
 
   // Clean raw text (margin detection, etc)
   cleanRawText(results, config);
+
+  // Flush debug log and render visualizations
+  if (logger.enabled) {
+    await logger.flush();
+    if (logger.shouldVisualize) {
+      const vizPath = logger.debugConfig.visualizePath ?? "./debug-output";
+      const paths = await renderAllVisualizations(logger.visualizerPages, vizPath);
+      for (const p of paths) {
+        process.stderr.write(`[grid-debug] Visualization: ${p}\n`);
+      }
+    }
+  }
 
   return results;
 }

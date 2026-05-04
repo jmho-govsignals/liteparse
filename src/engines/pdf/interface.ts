@@ -1,10 +1,21 @@
 import { TextItem } from "../../core/types.js";
 
+/** Options for page extraction */
+export interface ExtractOptions {
+  /** Whether to extract embedded image bounds (needed for OCR). Default: true */
+  extractImages?: boolean;
+}
+
 export interface PdfEngine {
   name: string;
   loadDocument(input: string | Uint8Array, password?: string): Promise<PdfDocument>;
-  extractPage(doc: PdfDocument, pageNum: number): Promise<PageData>;
-  extractAllPages(doc: PdfDocument, maxPages?: number, targetPages?: string): Promise<PageData[]>;
+  extractPage(doc: PdfDocument, pageNum: number, options?: ExtractOptions): Promise<PageData>;
+  extractAllPages(
+    doc: PdfDocument,
+    maxPages?: number,
+    targetPages?: string,
+    options?: ExtractOptions
+  ): Promise<PageData[]>;
   renderPageImage(
     doc: PdfDocument,
     pageNum: number,

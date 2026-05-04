@@ -115,16 +115,24 @@ See the [API reference](/liteparse/api/) for full type details.
 
 ## Python
 
-The Python package wraps the LiteParse CLI, so the Node.js CLI must be installed first.
+The Python package is a wrapper around the LiteParse Node.js CLI. **Node.js (>= 18) must be installed** on your system.
 
 ### Installation
+
+First, install the LiteParse CLI:
+
+```bash
+npm install -g @llamaindex/liteparse
+```
+
+Then install the Python package:
 
 ```bash
 pip install liteparse
 ```
 
 <Aside type="caution">
-  The Python package calls the LiteParse CLI under the hood: while the package can auto-install the CLI executable if not installed, it is recommended to do it separately (`npm install -g @llamaindex/liteparse` or `brew install run-llama/liteparse/llamaindex-liteparse`).
+  The Python package calls the LiteParse CLI under the hood via subprocess. Node.js (>= 18) is required. While the package can auto-install the CLI via `npm install -g @llamaindex/liteparse` on first use, it is recommended to install it separately beforehand.
 </Aside>
 
 ### Parsing a document
@@ -145,28 +153,31 @@ for page in result.pages:
 
 ### Configuration
 
-Options can be set on the constructor (applied to all parse calls) or per-call:
+The `LiteParse` constructor accepts `cli_path` (to override CLI auto-detection) and `install_if_not_available` (to control auto-install behavior). All parsing options are passed per-call:
 
 ```python
-# Constructor-level defaults
-parser = LiteParse(
+parser = LiteParse()
+
+result = parser.parse(
+    "document.pdf",
     ocr_enabled=True,
     ocr_server_url="http://localhost:8828/ocr",
     ocr_language="fra",
     dpi=300,
+    target_pages="1-5",
     password="secret",  # for encrypted/protected documents
 )
-
-# Per-call options
-result = parser.parse("document.pdf", target_pages="1-5")
 ```
 
 ### Parsing from bytes
 
-If you already have file contents in memory (e.g. from a web upload):
+If you already have file contents in memory (e.g. from a web upload), pass them directly to `parse()`:
 
 ```python
-result = parser.parse_bytes(pdf_bytes, filename="upload.pdf")
+with open("document.pdf", "rb") as f:
+    pdf_bytes = f.read()
+
+result = parser.parse(pdf_bytes)
 print(result.text)
 ```
 
@@ -182,5 +193,5 @@ result = parser.batch_parse(
     extension_filter=".pdf",
 )
 
-print(f"Parsed {result.success_count} files in {result.total_time_seconds}s")
+print(f"Output written to: {result.output_dir}")
 ```

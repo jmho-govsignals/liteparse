@@ -34,6 +34,7 @@ const textItemsJSON = results.map((r) => ({
   height: r.bbox[3] - r.bbox[1],
   fontName: "OCR",
   fontSize: r.bbox[3] - r.bbox[1],
+  confidence: 1.0,
 }));
 
 const pages = [
@@ -78,6 +79,43 @@ const pages = [
     boundingBoxes: [{ x1: 0, y1: 0, x2: 300, y2: 400 }],
   },
 ];
+
+// Native PDF text item (confidence defaults to 1.0)
+const nativeTextItem = {
+  str: "Native text",
+  x: 10,
+  y: 20,
+  width: 100,
+  height: 15,
+  w: 100,
+  h: 15,
+  fontName: "Helvetica",
+  fontSize: 12,
+  confidence: 1.0,
+};
+
+// OCR text item (confidence from OCR engine)
+const ocrTextItem = {
+  str: "OCR detected text",
+  x: 10,
+  y: 50,
+  width: 150,
+  height: 20,
+  w: 150,
+  h: 20,
+  fontName: "OCR",
+  fontSize: 20,
+  confidence: 0.95,
+};
+
+const mixedPage = {
+  pageNum: 1,
+  width: 612,
+  height: 792,
+  text: "Native text\nOCR detected text",
+  textItems: [nativeTextItem, ocrTextItem],
+  boundingBoxes: [],
+};
 
 const pagesJSON = {
   pages: [
@@ -139,5 +177,37 @@ describe("test json utilities", () => {
   it("test formatJSON", () => {
     const result = formatJSON(parseResult);
     expect(result).toBe(JSON.stringify(pagesJSON, null, 2));
+  });
+});
+
+describe("confidence field", () => {
+  it("includes OCR confidence score for OCR items", () => {
+    const result = buildJSON([mixedPage]);
+    const items = result.pages[0].textItems;
+    const ocrItem = items.find((i) => i.text === "OCR detected text");
+    expect(ocrItem?.confidence).toBe(0.95);
+  });
+
+  it("defaults to 1.0 for native PDF items", () => {
+    const result = buildJSON([mixedPage]);
+    const items = result.pages[0].textItems;
+    const nativeItem = items.find((i) => i.text === "Native text");
+    expect(nativeItem?.confidence).toBe(1.0);
+  });
+
+  it("preserves confidence of 0.0", () => {
+    const zeroConfidenceItem = { ...ocrTextItem, confidence: 0.0 };
+    const page = { ...mixedPage, textItems: [zeroConfidenceItem] };
+    const result = buildJSON([page]);
+    const item = result.pages[0].textItems[0];
+    expect(item.confidence).toBe(0.0);
+  });
+
+  it("defaults to 1.0 when confidence is undefined", () => {
+    const { confidence: _confidence, ...itemWithoutConfidence } = nativeTextItem;
+    const page = { ...mixedPage, textItems: [itemWithoutConfidence] };
+    const result = buildJSON([page]);
+    const item = result.pages[0].textItems[0];
+    expect(item.confidence).toBe(1.0);
   });
 });

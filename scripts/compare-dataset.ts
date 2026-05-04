@@ -219,6 +219,12 @@ async function main() {
   try {
     expected = await loadDataset(datasetDir);
     console.log(`Loaded ${expected.size} expected entries\n`);
+
+    if (expected.size === 0) {
+      console.error("ERROR: metadata.jsonl is empty — dataset has no entries to compare against.");
+      console.error("The dataset may need to be regenerated with: npx tsx scripts/create-dataset.ts");
+      process.exit(2);
+    }
   } catch (error) {
     console.error(`Failed to load dataset: ${error}`);
     process.exit(2);

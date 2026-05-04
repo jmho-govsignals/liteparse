@@ -2,19 +2,30 @@
 
 Python wrapper for [LiteParse](https://github.com/run-llama/liteparse) - fast, lightweight document parsing with optional OCR.
 
+> **Important:** This package is a Python wrapper around the LiteParse Node.js CLI.
+> You must have **Node.js** (>= 18) installed on your system. The CLI will be auto-installed
+> via npm on first use if not already present, or you can install it manually beforehand.
+
 ## Installation
+
+### Step 1: Install Node.js
+
+LiteParse requires Node.js (>= 18). Install it from [nodejs.org](https://nodejs.org/) or via your package manager.
+
+### Step 2: Install the LiteParse CLI
+
+```bash
+npm install -g @llamaindex/liteparse
+```
+
+### Step 3: Install the Python package
 
 ```bash
 pip install liteparse
 ```
 
-While the python package can auto-install the LiteParse CLI if not installed, it is recommended to do it separately:
-
-```bash
-npm install -g liteparse
-# or
-npx liteparse --version
-```
+> **Note:** If you skip Step 2, the Python package will attempt to auto-install the CLI
+> via `npm install -g @llamaindex/liteparse` on first use (requires npm in your PATH).
 
 ## Quick Start
 
@@ -35,6 +46,8 @@ for page in result.pages:
 
 ## Configuration
 
+All parsing options are passed per-call to `parse()`:
+
 ```python
 from liteparse import LiteParse
 
@@ -45,8 +58,20 @@ result = parser.parse(
     ocr_enabled=False,
     max_pages=10,
     dpi=150,
-    preserve_small_text=True,
+    preserve_very_small_text=True,
 )
+print(result.text)
+```
+
+## Parsing from bytes
+
+If you already have file contents in memory (e.g. from a web upload), pass them directly:
+
+```python
+with open("document.pdf", "rb") as f:
+    pdf_bytes = f.read()
+
+result = parser.parse(pdf_bytes)
 print(result.text)
 ```
 
@@ -57,18 +82,18 @@ For parsing multiple files, batch mode is significantly faster as it reuses the 
 ```python
 from liteparse import LiteParse
 
-parser = LiteParse(ocr_enabled=False)
+parser = LiteParse()
 
 # Parse all documents in a directory
 result = parser.batch_parse(
     input_dir="./documents",
     output_dir="./output",
+    ocr_enabled=False,
     recursive=True,              # Include subdirectories
     extension_filter=".pdf",     # Only PDF files
 )
 
-print(f"Parsed {result.success_count} files in {result.total_time_seconds}s")
-print(f"Average: {result.avg_time_ms}ms per file")
+print(f"Output written to: {result.output_dir}")
 ```
 
 ## Supported Formats
@@ -83,7 +108,7 @@ print(f"Average: {result.avg_time_ms}ms per file")
 
 1. **Disable OCR** if your documents have selectable text:
    ```python
-   parser = LiteParse(ocr_enabled=False)
+   result = parser.parse("doc.pdf", ocr_enabled=False)
    ```
 
 2. **Use batch mode** for multiple files to avoid cold-start overhead:

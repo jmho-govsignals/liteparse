@@ -59,7 +59,7 @@ The most complex (and important!) part of the codebase (`src/processing/gridProj
 - **Forward anchors**: Carry alignment information between lines
 - **Column detection**: Identifies multi-column layouts
 - **Rotation handling**: Transforms 90°, 180°, 270° rotated text to correct reading order
-- **OCR merging**: Combines native PDF text with OCR results
+- **OCR merging**: Combines native PDF text with OCR results, preserving confidence scores and source flags in output
 
 ### 3. Selective OCR
 OCR only runs on embedded images where text extraction failed, not the entire document. This balances accuracy with performance.

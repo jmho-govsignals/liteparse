@@ -18,6 +18,7 @@ export function buildJSON(pages: ParsedPage[]): ParseResultJson {
         height: item.height,
         fontName: item.fontName,
         fontSize: item.fontSize,
+        confidence: item.confidence ?? 1.0,
       })),
       boundingBoxes: page.boundingBoxes || [],
     })),

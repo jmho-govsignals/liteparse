@@ -1,6 +1,17 @@
 import os from "os";
+import path from "path";
 import { vi, describe, it, expect, afterEach } from "vitest";
-import { EventEmitter } from "events";
+
+interface SpawnPlan {
+  stdout?: string;
+  stderr?: string;
+  code?: number;
+  error?: Error;
+}
+
+const libreOfficePath = "C:\\Program Files\\LibreOffice\\program\\soffice.exe\n";
+const imageMagickPath = "C:\\Program Files\\ImageMagick\\magick.exe\n";
+const imageMagickVersion = "Version: ImageMagick 7.1.2-18 Q16-HDRI\n";
 
 const mockFileTypeFromFile = vi.fn();
 vi.mock("file-type", () => ({
@@ -42,15 +53,86 @@ vi.mock("file-type", () => ({
   }),
 }));
 
-const mockProc = {
-  stdout: new EventEmitter(),
-  stderr: new EventEmitter(),
-  kill: vi.fn(),
-  on: vi.fn(),
-};
+const { spawnPlans, enqueueSpawnPlan, spawnMock } = vi.hoisted(() => {
+  class MockEmitter {
+    private listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+    on(event: string, cb: (...args: unknown[]) => void) {
+      const existing = this.listeners.get(event) ?? [];
+      existing.push(cb);
+      this.listeners.set(event, existing);
+      return this;
+    }
+
+    emit(event: string, ...args: unknown[]) {
+      for (const cb of this.listeners.get(event) ?? []) {
+        cb(...args);
+      }
+    }
+  }
+
+  const plans: SpawnPlan[] = [];
+
+  function enqueuePlan(plan: SpawnPlan) {
+    plans.push(plan);
+  }
+
+  const mock = vi.fn(() => {
+    const plan = plans.shift() ?? { code: 0 };
+    const stdout = new MockEmitter();
+    const stderr = new MockEmitter();
+
+    const proc = {
+      stdout,
+      stderr,
+      kill: vi.fn(),
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === "error" && plan.error) {
+          queueMicrotask(() => cb(plan.error));
+        }
+        if (event === "close" && !plan.error) {
+          queueMicrotask(() => {
+            if (plan.stdout) stdout.emit("data", plan.stdout);
+            if (plan.stderr) stderr.emit("data", plan.stderr);
+            cb(plan.code ?? 0);
+          });
+        }
+        return proc;
+      }),
+    };
+
+    return proc;
+  });
+
+  return {
+    spawnPlans: plans,
+    enqueueSpawnPlan: enqueuePlan,
+    spawnMock: mock,
+  };
+});
+
+function enqueueSpawnPlans(...plans: SpawnPlan[]): void {
+  for (const plan of plans) {
+    enqueueSpawnPlan(plan);
+  }
+}
+
+function enqueueMissingCommandLookups(count: number): void {
+  for (let index = 0; index < count; index += 1) {
+    enqueueSpawnPlan({ code: 1 });
+  }
+}
+
+function enqueueLibreOfficeLookup(): void {
+  enqueueSpawnPlans({ code: 1 }, { stdout: libreOfficePath, code: 0 });
+}
+
+function enqueueImageMagickLookup(): void {
+  enqueueSpawnPlans({ stdout: imageMagickPath, code: 0 }, { stdout: imageMagickVersion, code: 0 });
+}
 
 vi.mock("child_process", () => ({
-  spawn: vi.fn(() => mockProc),
+  spawn: spawnMock,
 }));
 
 vi.mock("fs", async () => {
@@ -59,7 +141,6 @@ vi.mock("fs", async () => {
     ...actual,
     promises: {
       access: vi.fn(async (path: string, _mode?: number) => {
-        console.log(path);
         const toErrorPath = [
           "/Applications/LibreOffice.app/Contents/MacOS/soffice",
           "/Applications/LibreOffice.app/Contents/MacOS/libreoffice",
@@ -94,6 +175,13 @@ import {
   getTmpDir,
 } from "./convertToPdf";
 
+afterEach(() => {
+  spawnPlans.length = 0;
+  spawnMock.mockClear();
+  mockFileTypeFromFile.mockReset();
+  vi.restoreAllMocks();
+});
+
 describe("test guessFileExtension", () => {
   it("detects PDF via file-type", async () => {
     mockFileTypeFromFile.mockResolvedValue({ ext: "pdf", mime: "application/pdf" });
@@ -105,9 +193,9 @@ describe("test guessFileExtension", () => {
     expect(await guessFileExtension("/some/file")).toBe(".png");
   });
 
-  it("defaults to .pdf when file-type returns undefined", async () => {
+  it("returns null when file-type returns undefined", async () => {
     mockFileTypeFromFile.mockResolvedValue(undefined);
-    expect(await guessFileExtension("/some/file")).toBe(".pdf");
+    expect(await guessFileExtension("/some/file")).toBeNull();
   });
 
   it("returns extension directly if present", async () => {
@@ -117,71 +205,81 @@ describe("test guessFileExtension", () => {
 
 describe("test command availability", () => {
   it("libreoffice available", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "/opt/bin/libreoffice");
+    enqueueLibreOfficeLookup();
+
     const result = await findLibreOfficeCommand();
     expect(result).toBe("libreoffice");
   });
 
   it("libreoffice not available", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(1);
-    });
-    mockProc.stderr.emit("data", "command not found");
-    // does not throw
+    enqueueMissingCommandLookups(4);
+
     const result = await findLibreOfficeCommand();
     expect(result).toBeNull();
   });
 
   it("imagemagick available", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "/opt/bin/libreoffice");
+    enqueueImageMagickLookup();
+
     const result = await findImageMagickCommand();
-    expect(result).toStrictEqual({ command: "magick", args: [] });
+    expect(result).toStrictEqual({
+      command: imageMagickPath.trim(),
+      args: [],
+      resolvedPath: imageMagickPath.trim(),
+    });
   });
 
   it("imagemagick not available", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(1);
-    });
-    mockProc.stderr.emit("data", "command not found");
-    // does not throw
+    enqueueMissingCommandLookups(2);
+
     const result = await findImageMagickCommand();
     expect(result).toBeNull();
+  });
+
+  it("rejects Windows system convert.exe", async () => {
+    enqueueSpawnPlans({ code: 1 }, { stdout: "C:\\Windows\\System32\\convert.exe\n", code: 0 });
+
+    const result = await findImageMagickCommand();
+    expect(result).toBeNull();
+  });
+
+  it("accepts ImageMagick convert on non-Windows", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    enqueueSpawnPlans(
+      { code: 1 },
+      { stdout: "/usr/bin/convert\n", code: 0 },
+      { stdout: "Version: ImageMagick 6.9.12-98 Q16\n", code: 0 }
+    );
+
+    const result = await findImageMagickCommand();
+    expect(result).toStrictEqual({
+      command: "/usr/bin/convert",
+      args: [],
+      resolvedPath: "/usr/bin/convert",
+    });
   });
 });
 
 describe("test convertOfficeDocument", () => {
   it("conversion succeeds", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "conversion successfull");
+    enqueueLibreOfficeLookup();
+    enqueueSpawnPlan({ stdout: "conversion successful", code: 0 });
 
     const result = await convertOfficeDocument("test.docx", "./");
     expect(result).toBe("test.pdf");
   });
 
   it("conversion fails (command not found)", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(1);
-    });
-    mockProc.stdout.emit("data", "command not found");
+    enqueueMissingCommandLookups(4);
 
     await expect(convertOfficeDocument("test_command.docx", "./")).rejects.toThrow(
-      "LibreOffice is not installed. Please install LibreOffice to convert office documents. On macOS: brew install --cask libreoffice, On Ubuntu: apt-get install libreoffice"
+      "LibreOffice is not installed. Please install LibreOffice to convert office documents. On macOS: brew install --cask libreoffice, On Ubuntu: apt-get install libreoffice, On Windows: choco install libreoffice-fresh"
     );
   });
 
   it("conversion fails (output not found)", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "conversion successfull");
+    enqueueLibreOfficeLookup();
+    enqueueSpawnPlan({ stdout: "conversion successful", code: 0 });
 
     await expect(convertOfficeDocument("test_fail.docx", "./")).rejects.toThrow(
       "LibreOffice conversion succeeded but output PDF not found"
@@ -191,23 +289,18 @@ describe("test convertOfficeDocument", () => {
 
 describe("test convertImageToPdf", () => {
   it("conversion succeeds", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "conversion successfull");
+    enqueueImageMagickLookup();
+    enqueueSpawnPlan({ stdout: "conversion successful", code: 0 });
 
     const result = await convertImageToPdf("test.png", "./");
     expect(result).toBe("test.pdf");
   });
 
   it("conversion fails (command not found)", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(1);
-    });
-    mockProc.stdout.emit("data", "command not found");
+    enqueueMissingCommandLookups(2);
 
     await expect(convertImageToPdf("test_command.png", "./")).rejects.toThrow(
-      "ImageMagick is not installed. Please install ImageMagick to convert images. On macOS: brew install imagemagick, On Ubuntu: apt-get install imagemagick"
+      "ImageMagick is not installed. Please install ImageMagick to convert images. On macOS: brew install imagemagick, On Ubuntu: apt-get install imagemagick, On Windows: choco install imagemagick.app"
     );
   });
 });
@@ -222,46 +315,39 @@ describe("test convertToPdf", () => {
   });
 
   it("convert an office document (word)", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "conversion successfull");
+    enqueueLibreOfficeLookup();
+    enqueueSpawnPlan({ stdout: "conversion successful", code: 0 });
+
     const result = await convertToPdf("test_1.docx");
     expect(result).toStrictEqual({
-      pdfPath: "/tmp/test/test_1.pdf",
+      pdfPath: path.join("/tmp/test", "test_1.pdf"),
       originalExtension: ".docx",
     });
   });
 
   it("convert an office document (xlsx)", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "conversion successfull");
+    enqueueLibreOfficeLookup();
+    enqueueSpawnPlan({ stdout: "conversion successful", code: 0 });
+
     const result = await convertToPdf("test.xlsx");
     expect(result).toStrictEqual({
-      pdfPath: "/tmp/test/test.pdf",
+      pdfPath: path.join("/tmp/test", "test.pdf"),
       originalExtension: ".xlsx",
     });
   });
 
   it("convert an image", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "conversion successfull");
+    enqueueImageMagickLookup();
+    enqueueSpawnPlan({ stdout: "conversion successful", code: 0 });
+
     const result = await convertToPdf("test.png");
     expect(result).toStrictEqual({
-      pdfPath: "/tmp/test/test.pdf",
+      pdfPath: path.join("/tmp/test", "test.pdf"),
       originalExtension: ".png",
     });
   });
 
   it("convert a text file", async () => {
-    mockProc.on.mockImplementation((event, cb) => {
-      if (event === "close") cb(0);
-    });
-    mockProc.stdout.emit("data", "conversion successfull");
     const result = await convertToPdf("test.txt");
     expect(result).toStrictEqual({
       content: "hello world",
@@ -300,9 +386,9 @@ describe("test guessExtensionFromBuffer", () => {
     expect(await guessExtensionFromBuffer(zipBytes)).toBe(".zip");
   });
 
-  it("defaults to .pdf for unknown bytes", async () => {
+  it("returns null for unknown bytes", async () => {
     const unknownBytes = Buffer.from([0x00, 0x01, 0x02, 0x03]);
-    expect(await guessExtensionFromBuffer(unknownBytes)).toBe(".pdf");
+    expect(await guessExtensionFromBuffer(unknownBytes)).toBeNull();
   });
 
   it("works with Uint8Array input", async () => {

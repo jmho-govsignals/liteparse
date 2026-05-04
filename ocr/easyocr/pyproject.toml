@@ -8,13 +8,13 @@ dependencies = [
     "easyocr>=1.7.2",
     "fastapi>=0.132.0",
     "numpy>=2.4.2",
-    "pillow>=12.1.1",
-    "python-multipart>=0.0.22",
+    "pillow>=12.2.0",
+    "python-multipart>=0.0.26",
     "uvicorn>=0.41.0",
 ]
 
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
-    "pytest>=9.0.2",
+    "pytest>=9.0.3",
 ]

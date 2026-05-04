@@ -35,7 +35,7 @@ def _find_cli(install_if_not_available: bool) -> str:
     # Check if npx is available
     npx_path = shutil.which("npx")
     if npx_path:
-        return "npx liteparse"
+        return "npx @llamaindex/liteparse"
 
     # Check common node_modules locations
     possible_paths = [
@@ -49,9 +49,17 @@ def _find_cli(install_if_not_available: bool) -> str:
             return os.path.abspath(path)
 
     if install_if_not_available:
+        npm_path = shutil.which("npm")
+        if not npm_path:
+            raise CLINotFoundError(
+                "liteparse CLI not found and npm is not available to auto-install it.\n"
+                "Please install Node.js (>= 18) from https://nodejs.org/ and then run:\n"
+                "  npm install -g @llamaindex/liteparse"
+            )
         warnings.warn(
-            "liteparse CLI could not be find. Running `npm install -g @llamaindex/liteparse` to install it.",
+            "liteparse CLI could not be found. Running `npm install -g @llamaindex/liteparse` to install it.",
             UserWarning,
+            stacklevel=2,
         )
         result = subprocess.run(
             ["npm", "install", "-g", "@llamaindex/liteparse"],
@@ -67,7 +75,8 @@ def _find_cli(install_if_not_available: bool) -> str:
             return cli_path
 
     raise CLINotFoundError(
-        "liteparse CLI not found. Please install it with: npm i -g @llamaindex/liteparse"
+        "liteparse CLI not found. Please install Node.js (>= 18) and then run:\n"
+        "  npm install -g @llamaindex/liteparse"
     )
 
 
@@ -86,6 +95,7 @@ def _parse_json_result(json_data: dict) -> ParseResult:
                     y=item.get("y", 0),
                     width=item.get("width", 0),
                     height=item.get("height", 0),
+                    confidence=item.get("confidence"),
                     fontName=item.get("fontName"),
                     fontSize=item.get("fontSize"),
                 )
@@ -330,7 +340,10 @@ class LiteParse:
             json_data = json.loads(stdout.decode("utf-8"))
             return _parse_json_result(json_data)
         except json.JSONDecodeError as e:
-            raise ParseError(f"Failed to parse CLI output: {e}")
+            raise ParseError(
+                f"Failed to parse CLI output: {e}",
+                stderr=stderr.decode("utf-8"),
+            )
 
     @staticmethod
     def _get_screenshot_result(

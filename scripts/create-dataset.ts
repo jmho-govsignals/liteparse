@@ -161,6 +161,12 @@ async function main() {
     }
   }
 
+  // Validate we actually produced entries
+  if (allRows.length === 0) {
+    console.error("\nERROR: No dataset entries were generated. Check that source documents exist and are parseable.");
+    process.exit(1);
+  }
+
   // Write metadata.jsonl
   const metadataPath = path.join(outputDir, "metadata.jsonl");
   const metadataContent = allRows.map((row) => JSON.stringify(row)).join("\n");

@@ -21,7 +21,8 @@ Output formatters that convert parsed document data into different formats.
       text: string,
       x, y, width, height: number,
       fontName: string,
-      fontSize: number
+      fontSize: number,
+      confidence: number       // 1.0 for native PDF text, 0.0-1.0 for OCR
     }],
     boundingBoxes: BoundingBox[],
   }]

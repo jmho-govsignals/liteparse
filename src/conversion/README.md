@@ -26,6 +26,7 @@ LiteParse's core parsing works on PDFs. This module extends support to 50+ forma
 - **ImageMagick** - For images
   - macOS: `brew install imagemagick`
   - Ubuntu: `apt-get install imagemagick`
+  - Windows: LiteParse resolves the executable path and validates that the binary is actually ImageMagick, avoiding false matches against the built-in `C:\Windows\System32\convert.exe`
 
 **Key Functions:**
 
@@ -50,9 +51,11 @@ LiteParse's core parsing works on PDFs. This module extends support to 50+ forma
 `guessFileExtension(filePath)` - Detects format from extension or magic bytes
 - Checks file extension first
 - Falls back to magic byte detection (PDF, PNG, JPEG, ZIP-based)
+- Returns `null` when format cannot be determined
 
 `guessExtensionFromBuffer(data)` - Detects format from raw bytes using magic bytes
 - Supports PDF, PNG, JPEG, TIFF (both endians), and ZIP-based formats
+- Returns `null` when format cannot be determined (e.g. plain text)
 - Used by `convertBufferToPdf` to determine the temp file extension
 
 **Design Decisions:**
@@ -65,7 +68,9 @@ LiteParse's core parsing works on PDFs. This module extends support to 50+ forma
 
 4. **Timeout handling**: 2 minutes for LibreOffice, 1 minute for ImageMagick.
 
-5. **Magic byte fallback**: Handles files without extensions or with wrong extensions.
+5. **Executable validation on Windows**: Image conversion validates the resolved executable path and probes the binary with `-version` so Windows `convert.exe` is never mistaken for ImageMagick.
+
+6. **Magic byte fallback**: Handles files without extensions or with wrong extensions.
 
 **Error Codes:**
 - `FILE_NOT_FOUND` - Input file doesn't exist
