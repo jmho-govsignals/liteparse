@@ -4,6 +4,7 @@ use crate::bitmap::Bitmap;
 use crate::document::Document;
 use crate::error::PdfiumError;
 use crate::text_page::TextPage;
+use crate::types::RectF;
 
 /// Bounding box of an embedded image object on a page.
 /// Coordinates are in PDF points with top-left origin (Y-down).
@@ -32,6 +33,65 @@ impl Page<'_> {
 
     pub fn rotation(&self) -> i32 {
         unsafe { pdfium_sys::FPDFPage_GetRotation(self.handle) }
+    }
+
+    /// Get the page bounding box (CropBox, falls back to MediaBox).
+    /// Coordinates in PDF page space.
+    pub fn view_box(&self) -> Option<RectF> {
+        let mut rect = pdfium_sys::FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+        let ok = unsafe { pdfium_sys::FPDF_GetPageBoundingBox(self.handle, &mut rect) };
+        if ok != 0 {
+            Some(RectF { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom })
+        } else {
+            None
+        }
+    }
+
+    /// Convert a point from PDF page space to viewport space (top-left origin, 72 DPI).
+    /// Mirrors the platform's Parse_pageToViewport using FPDF_PageToDevice at 1000x scale.
+    pub fn page_to_viewport(&self, view_box: &RectF, page_x: f32, page_y: f32) -> (f32, f32) {
+        let mut vw = view_box.right - view_box.left;
+        let mut vh = view_box.top - view_box.bottom;
+
+        let rotation = self.rotation();
+        if rotation == 1 || rotation == 3 {
+            // 90° or 270° — swap viewport dimensions
+            std::mem::swap(&mut vw, &mut vh);
+        }
+
+        let device_w = (vw * 1000.0).round() as i32;
+        let device_h = (vh * 1000.0).round() as i32;
+        let mut dx: i32 = 0;
+        let mut dy: i32 = 0;
+
+        unsafe {
+            pdfium_sys::FPDF_PageToDevice(
+                self.handle,
+                0, 0,
+                device_w, device_h,
+                0, // rotation 0 — PDFium applies page rotation internally
+                page_x as f64,
+                page_y as f64,
+                &mut dx,
+                &mut dy,
+            );
+        }
+
+        (dx as f32 / 1000.0, dy as f32 / 1000.0)
+    }
+
+    /// Convert bounds from PDF page space to viewport space (top-left origin).
+    /// Returns RectF with left/top/right/bottom in viewport coordinates.
+    pub fn bounds_to_viewport(&self, view_box: &RectF, page_bounds: &RectF) -> RectF {
+        let (ll_x, ll_y) = self.page_to_viewport(view_box, page_bounds.left, page_bounds.bottom);
+        let (ur_x, ur_y) = self.page_to_viewport(view_box, page_bounds.right, page_bounds.top);
+
+        RectF {
+            left: ll_x.min(ur_x),
+            top: ll_y.min(ur_y),
+            right: ll_x.max(ur_x),
+            bottom: ll_y.max(ur_y),
+        }
     }
 
     pub fn text(&self) -> Result<TextPage<'_>, PdfiumError> {

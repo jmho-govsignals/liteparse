@@ -1470,16 +1470,7 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
             page_width: page.page_width,
             page_height: page.page_height,
             text,
-            text_items: projected_items.into_iter().map(|proj| TextItem {
-                text: proj.item.text,
-                x: proj.item.x,
-                y: proj.item.y,
-                width: proj.item.width,
-                height: proj.item.height,
-                rotation: proj.item.rotation,
-                font_name: proj.item.font_name,
-                font_size: proj.item.font_size,
-            }).collect(),
+            text_items: projected_items.into_iter().map(|proj| proj.item).collect(),
         }
     }).collect()
 }

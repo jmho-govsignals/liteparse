@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::page::Page;
-use crate::types::{CharBox, Matrix, RectF, TextRect};
+use crate::types::{CharBox, Color, Matrix, RectF, TextRect};
 
 pub struct TextPage<'page> {
     pub(crate) handle: pdfium_sys::FPDF_TEXTPAGE,
@@ -132,6 +132,12 @@ impl TextChar<'_> {
         unsafe { pdfium_sys::FPDFText_GetUnicode(self.text_page.handle, self.index) }
     }
 
+    /// Raw character code from the PDF content stream (not Unicode).
+    /// Only meaningful for non-generated characters.
+    pub fn char_code(&self) -> u32 {
+        unsafe { pdfium_sys::FPDFText_GetCharCode(self.text_page.handle, self.index) }
+    }
+
     pub fn font_size(&self) -> f64 {
         unsafe { pdfium_sys::FPDFText_GetFontSize(self.text_page.handle, self.index) }
     }
@@ -140,15 +146,16 @@ impl TextChar<'_> {
         unsafe { pdfium_sys::FPDFText_GetFontWeight(self.text_page.handle, self.index) }
     }
 
-    pub fn font_name(&self) -> Option<String> {
-        // First call to get required buffer size
+    /// Get font info name and flags. Returns (name, flags) or None.
+    pub fn font_info(&self) -> Option<(String, i32)> {
+        let mut flags: i32 = 0;
         let len = unsafe {
             pdfium_sys::FPDFText_GetFontInfo(
                 self.text_page.handle,
                 self.index,
                 std::ptr::null_mut(),
                 0,
-                std::ptr::null_mut(),
+                &mut flags,
             )
         };
         if len == 0 {
@@ -161,24 +168,78 @@ impl TextChar<'_> {
                 self.index,
                 buf.as_mut_ptr() as *mut std::ffi::c_void,
                 len,
-                std::ptr::null_mut(),
+                &mut flags,
             )
         };
         if written == 0 {
             return None;
         }
-        // Strip trailing NUL
         let str_len = if written > 0 && buf[(written - 1) as usize] == 0 {
             (written - 1) as usize
         } else {
             written as usize
         };
-        Some(String::from_utf8_lossy(&buf[..str_len]).into_owned())
+        Some((String::from_utf8_lossy(&buf[..str_len]).into_owned(), flags))
+    }
+
+    pub fn font_name(&self) -> Option<String> {
+        self.font_info().map(|(name, _)| name)
     }
 
     /// Angle in radians. Returns -1 on error.
     pub fn angle(&self) -> f32 {
         unsafe { pdfium_sys::FPDFText_GetCharAngle(self.text_page.handle, self.index) }
+    }
+
+    /// Get the FPDF_PAGEOBJECT for this character (for font/color extraction).
+    pub fn text_object(&self) -> Option<pdfium_sys::FPDF_PAGEOBJECT> {
+        let obj = unsafe { pdfium_sys::FPDFText_GetTextObject(self.text_page.handle, self.index) };
+        if obj.is_null() { None } else { Some(obj) }
+    }
+
+    /// Get stroke color (r, g, b, a).
+    pub fn stroke_color(&self) -> Option<Color> {
+        let mut r = 0u32;
+        let mut g = 0u32;
+        let mut b = 0u32;
+        let mut a = 0u32;
+        let ok = unsafe {
+            pdfium_sys::FPDFText_GetStrokeColor(
+                self.text_page.handle, self.index,
+                &mut r, &mut g, &mut b, &mut a,
+            )
+        };
+        if ok != 0 {
+            Some(Color { r: r as u8, g: g as u8, b: b as u8, a: a as u8 })
+        } else {
+            None
+        }
+    }
+
+    /// Get fill color (r, g, b, a).
+    pub fn fill_color(&self) -> Option<Color> {
+        let mut r = 0u32;
+        let mut g = 0u32;
+        let mut b = 0u32;
+        let mut a = 0u32;
+        let ok = unsafe {
+            pdfium_sys::FPDFText_GetFillColor(
+                self.text_page.handle, self.index,
+                &mut r, &mut g, &mut b, &mut a,
+            )
+        };
+        if ok != 0 {
+            Some(Color { r: r as u8, g: g as u8, b: b as u8, a: a as u8 })
+        } else {
+            None
+        }
+    }
+
+    /// Get marked content ID from the page object (-1 if none).
+    pub fn marked_content_id(&self) -> Option<i32> {
+        let obj = self.text_object()?;
+        let mcid = unsafe { pdfium_sys::FPDFPageObj_GetMarkedContentID(obj) };
+        if mcid >= 0 { Some(mcid) } else { None }
     }
 
     pub fn char_box(&self) -> Option<CharBox> {

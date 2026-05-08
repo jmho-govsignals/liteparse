@@ -23,13 +23,41 @@ pub enum InputType {
 #[derive(Debug, Clone, Serialize)]
 pub struct TextItem {
     pub text: String,
+    /// Viewport-space coordinates (top-left origin, 72 DPI).
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Rotation in degrees (counter-clockwise, adjusted for page rotation).
     pub rotation: f32,
     pub font_name: Option<String>,
     pub font_size: Option<f32>,
+    /// Font size * scale_y from the text matrix — accounts for CTM scaling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_ascent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_descent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_weight: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_flags: Option<i32>,
+    /// Sum of glyph widths (using charcode-based lookup when possible).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_width: Option<f32>,
+    /// Whether the font has buggy encoding (private-use codepoints, TT subset, etc.)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub font_is_buggy: bool,
+    /// Marked content ID from the PDF structure tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcid: Option<i32>,
+    /// Fill color as ARGB hex string (e.g. "ff000000").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_color: Option<String>,
+    /// Stroke color as ARGB hex string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke_color: Option<String>,
 }
 
 /// Represents a single page in a PDF document, including its dimensions and extracted text items.

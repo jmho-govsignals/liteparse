@@ -1,8 +1,8 @@
-use pdfium::{Library, TextPage};
-use crate::types::{TextItem, Page};
+use pdfium::{Font, FontType, Library, Page, RectF, TextPage};
+use crate::types::{TextItem, Page as LitePage};
 
 /// Extract pages from a PDF file and return them as structured data.
-pub fn extract_pages(pdf_path: &str, page_num: Option<u32>) -> Result<Vec<Page>, Box<dyn std::error::Error>> {
+pub fn extract_pages(pdf_path: &str, page_num: Option<u32>) -> Result<Vec<LitePage>, Box<dyn std::error::Error>> {
     let lib = Library::init();
     let document = lib.load_document(pdf_path, None)?;
     let page_count = document.page_count();
@@ -17,18 +17,18 @@ pub fn extract_pages(pdf_path: &str, page_num: Option<u32>) -> Result<Vec<Page>,
 
         let page = document.page(page_index)?;
         let text_page = page.text()?;
-        let mut text_items = extract_page_text_items(&text_page)?;
-        let page_height = page.height();
+        let view_box = page.view_box().unwrap_or(RectF {
+            left: 0.0,
+            top: page.height(),
+            right: page.width(),
+            bottom: 0.0,
+        });
+        let text_items = extract_page_text_items(&page, &text_page, &view_box)?;
 
-        // Convert from pdfium bottom-left origin to top-left origin
-        for item in &mut text_items {
-            item.y = page_height - item.y - item.height;
-        }
-
-        pages.push(Page {
+        pages.push(LitePage {
             page_number: (page_index + 1) as usize,
             page_width: page.width(),
-            page_height,
+            page_height: page.height(),
             text_items,
         });
     }
@@ -57,15 +57,20 @@ pub fn extract(pdf_path: &str, page_num: Option<u32>) -> Result<(), Box<dyn std:
 /// - Line changes (large vertical shift)
 /// - Column breaks (large horizontal gap)
 /// - Explicit newline characters
-fn extract_page_text_items(text_page: &TextPage) -> Result<Vec<TextItem>, Box<dyn std::error::Error>> {
+fn extract_page_text_items(
+    page: &Page,
+    text_page: &TextPage,
+    view_box: &RectF,
+) -> Result<Vec<TextItem>, Box<dyn std::error::Error>> {
     let char_count = text_page.char_count();
     if char_count <= 0 {
         return Ok(Vec::new());
     }
 
     // Hard limit: gaps larger than this always cause a split (column breaks).
-    const MAX_INLINE_GAP: f64 = 15.0;
+    const MAX_INLINE_GAP: f32 = 15.0;
 
+    let page_rotation = page.rotation();
     let mut items: Vec<TextItem> = Vec::new();
     let mut seg = SegmentBuilder::new();
 
@@ -95,8 +100,6 @@ fn extract_page_text_items(text_page: &TextPage) -> Result<Vec<TextItem>, Box<dy
         }
 
         // Spaces: mark that we're in a pending-space state.
-        // The space will be committed (or cause a split) when the next
-        // visible character arrives and we can measure the actual gap.
         if c == ' ' {
             seg.mark_pending_space();
             continue;
@@ -107,44 +110,45 @@ fn extract_page_text_items(text_page: &TextPage) -> Result<Vec<TextItem>, Box<dy
             continue;
         }
 
-        // Get the character's bounding box (PDF coordinates: bottom-left origin)
-        let Some(cb) = ch.char_box() else { continue };
+        // Get loose bounds in viewport space for the item bounding box
+        let Some(loose_box) = ch.loose_char_box() else { continue };
+        let vp_loose = page.bounds_to_viewport(view_box, &loose_box);
+
+        // Also get strict char box for gap calculation (stays in viewport space)
+        let Some(strict_box) = ch.char_box() else { continue };
+        let strict_rect = RectF {
+            left: strict_box.left as f32,
+            top: strict_box.top as f32,
+            right: strict_box.right as f32,
+            bottom: strict_box.bottom as f32,
+        };
+        let vp_strict = page.bounds_to_viewport(view_box, &strict_rect);
 
         if seg.has_content {
-            // Check whether this character belongs to the current segment.
-            // Use actual bounding box overlap with a small tolerance (2pt)
-            // to handle floating point imprecision while still keeping
-            // separate lines apart (~3pt gap between 10pt lines).
-            // Superscripts/subscripts naturally overlap the baseline bbox.
-            let y_tolerance = 2.0;
-            let y_overlap = cb.bottom < seg.top + y_tolerance
-                && cb.top > seg.bottom - y_tolerance;
+            // Use viewport-space coordinates for gap/overlap checks
+            let y_tolerance: f32 = 2.0;
+            let y_overlap = vp_loose.top < seg.vp_bottom + y_tolerance
+                && vp_loose.bottom > seg.vp_top - y_tolerance;
 
-            let gap = cb.left - seg.last_char_right;
+            let gap = vp_strict.left - seg.last_char_right;
 
             if !y_overlap || gap >= MAX_INLINE_GAP {
-                // Different line or huge gap — always split.
                 seg.flush(&mut items);
-                seg.start(c, &cb, &ch);
+                seg.start(c, &vp_loose, &vp_strict, &ch, page_rotation);
             } else if seg.pending_space {
-                // There was a space before this character. Decide whether
-                // to keep it in the same segment or split.
-                // Split when the gap is large relative to the avg char width —
-                // this separates table columns while keeping body text words
-                // together.
                 let avg_cw = seg.avg_char_width();
                 if gap > avg_cw * 1.6 {
                     seg.flush(&mut items);
-                    seg.start(c, &cb, &ch);
+                    seg.start(c, &vp_loose, &vp_strict, &ch, page_rotation);
                 } else {
                     seg.commit_pending_space();
-                    seg.push_char(c, &cb);
+                    seg.push_char(c, &vp_loose, &vp_strict, &ch);
                 }
             } else {
-                seg.push_char(c, &cb);
+                seg.push_char(c, &vp_loose, &vp_strict, &ch);
             }
         } else {
-            seg.start(c, &cb, &ch);
+            seg.start(c, &vp_loose, &vp_strict, &ch, page_rotation);
         }
     }
 
@@ -152,25 +156,93 @@ fn extract_page_text_items(text_page: &TextPage) -> Result<Vec<TextItem>, Box<dy
     Ok(items)
 }
 
+/// Adjust character angle for page rotation.
+/// PDFium returns counter-clockwise angle in PDF space; page /Rotate is clockwise.
+fn adjust_angle_for_rotation(angle_rad: f32, page_rotation: i32) -> f32 {
+    use std::f32::consts::PI;
+    let mut a = angle_rad;
+    match page_rotation {
+        1 => a -= 3.0 * PI / 2.0, // 90°
+        2 => a -= PI,               // 180°
+        3 => a -= PI / 2.0,         // 270°
+        _ => {}
+    }
+    a = a.rem_euclid(2.0 * PI);
+    a
+}
+
+/// Decompose scale factors from a 2D affine matrix.
+/// Computes eigenvalues of M^T * M, matching the platform's Parse_decomposeScale.
+fn decompose_scale(m: &pdfium::Matrix) -> (f32, f32) {
+    let (a, b, c, d) = (m.a as f64, m.b as f64, m.c as f64, m.d as f64);
+    // M^T * M
+    let mt_a = a * a + b * b;
+    let mt_b = a * c + b * d;
+    let mt_d = c * c + d * d;
+    let first = (mt_a + mt_d) / 2.0;
+    let disc = ((mt_a + mt_d).powi(2) - 4.0 * (mt_a * mt_d - mt_b * mt_b)).sqrt() / 2.0;
+    let sx = (first + disc).sqrt();
+    let sy = (first - disc).sqrt();
+    let sx = if sx.is_nan() { 1.0 } else { sx };
+    let sy = if sy.is_nan() { 1.0 } else { sy };
+    (sx as f32, sy as f32)
+}
+
+/// Check if a font is "buggy" based on its name and type.
+/// Mirrors ParseFont_isBuggyFont from the platform.
+fn is_buggy_font(font_name: &str, font_type: FontType) -> bool {
+    // TrueType subset fonts: name starts with "TT" or contains "+TT"
+    if font_name.starts_with("TT") || font_name.contains("+TT") {
+        return true;
+    }
+    // Type1 fonts with 6-char prefix + underscore: "ABCDEF_..."
+    if font_type == FontType::Type1 && font_name.len() >= 7 {
+        let bytes = font_name.as_bytes();
+        if bytes[6] == b'_' {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a Unicode codepoint indicates buggy encoding.
+fn is_buggy_codepoint(unicode: u32) -> bool {
+    unicode <= 0x1F || (unicode > 0xE000 && unicode <= 0xF8FF)
+}
+
+fn color_to_argb_hex(c: &pdfium::Color) -> String {
+    format!("{:02x}{:02x}{:02x}{:02x}", c.a, c.r, c.g, c.b)
+}
+
 /// Accumulates characters into a single TextItem segment.
 struct SegmentBuilder {
     text: String,
-    // Bounding box in PDF coordinates (bottom-left origin)
-    left: f64,
-    right: f64,
-    bottom: f64,
-    top: f64,
-    // Right edge of the last non-space character (for gap calculation)
-    last_char_right: f64,
+    // Viewport-space bounding box (union of loose bounds, top-left origin)
+    vp_left: f32,
+    vp_right: f32,
+    vp_top: f32,
+    vp_bottom: f32,
+    // Right edge of last char strict bounds (for gap calculation)
+    last_char_right: f32,
     // Count of non-space characters (for avg width calculation)
     char_count: usize,
     // Font metadata (captured from the first character)
     font_name: Option<String>,
     font_size: f32,
+    font_height: Option<f32>,
+    font_ascent: Option<f32>,
+    font_descent: Option<f32>,
+    font_weight: Option<i32>,
+    font_flags: Option<i32>,
+    font_is_buggy: bool,
+    font_is_embedded: bool,
+    font: Option<Font>,
     rotation_deg: f32,
+    text_width: f32,
+    mcid: Option<i32>,
+    fill_color: Option<String>,
+    stroke_color: Option<String>,
     has_content: bool,
-    // True when we've seen a space but haven't yet decided whether to
-    // commit it (keep in segment) or split on it.
     pending_space: bool,
 }
 
@@ -178,68 +250,172 @@ impl SegmentBuilder {
     fn new() -> Self {
         Self {
             text: String::new(),
-            left: f64::MAX,
-            right: f64::MIN,
-            bottom: f64::MAX,
-            top: f64::MIN,
-            last_char_right: f64::MIN,
+            vp_left: f32::MAX,
+            vp_right: f32::MIN,
+            vp_top: f32::MAX,
+            vp_bottom: f32::MIN,
+            last_char_right: f32::MIN,
             char_count: 0,
             font_name: None,
             font_size: 0.0,
+            font_height: None,
+            font_ascent: None,
+            font_descent: None,
+            font_weight: None,
+            font_flags: None,
+            font_is_buggy: false,
+            font_is_embedded: false,
+            font: None,
             rotation_deg: 0.0,
+            text_width: 0.0,
+            mcid: None,
+            fill_color: None,
+            stroke_color: None,
             has_content: false,
             pending_space: false,
         }
     }
 
-    /// Average width of non-space characters in the current segment.
-    fn avg_char_width(&self) -> f64 {
+    /// Average width of non-space characters in the current segment (viewport space).
+    fn avg_char_width(&self) -> f32 {
         if self.char_count == 0 {
-            return 5.0; // sensible default
+            return 5.0;
         }
-        (self.right - self.left) / self.char_count as f64
+        (self.vp_right - self.vp_left) / self.char_count as f32
     }
 
     /// Start a new segment with the given character.
-    fn start(&mut self, c: char, cb: &pdfium::CharBox, ch: &pdfium::TextChar) {
+    fn start(
+        &mut self,
+        c: char,
+        vp_loose: &RectF,
+        vp_strict: &RectF,
+        ch: &pdfium::TextChar,
+        page_rotation: i32,
+    ) {
         self.text.clear();
         self.text.push(c);
-        self.left = cb.left;
-        self.right = cb.right;
-        self.bottom = cb.bottom;
-        self.top = cb.top;
-        self.last_char_right = cb.right;
+        self.vp_left = vp_loose.left;
+        self.vp_right = vp_loose.right;
+        self.vp_top = vp_loose.top;
+        self.vp_bottom = vp_loose.bottom;
+        self.last_char_right = vp_strict.right;
         self.char_count = 1;
         self.has_content = true;
         self.pending_space = false;
+        self.text_width = 0.0;
+        self.font_is_buggy = false;
+        self.font_is_embedded = false;
+        self.font = None;
 
-        self.font_name = ch.font_name();
+        // Font info
+        if let Some((name, flags)) = ch.font_info() {
+            self.font_name = Some(name);
+            self.font_flags = Some(flags);
+        } else {
+            self.font_name = None;
+            self.font_flags = None;
+        }
+
         let fs = ch.font_size() as f32;
-        self.font_size = if fs > 0.0 { fs } else { (cb.top - cb.bottom) as f32 };
+        self.font_size = if fs > 0.0 { fs } else {
+            (vp_loose.bottom - vp_loose.top).abs()
+        };
 
+        self.font_weight = {
+            let w = ch.font_weight();
+            if w > 0 { Some(w) } else { None }
+        };
+
+        // Angle adjusted for page rotation
         let angle_rad = ch.angle();
         self.rotation_deg = if angle_rad >= 0.0 {
-            let mut deg = angle_rad.to_degrees();
-            if deg < 0.0 { deg += 360.0; }
-            deg
+            adjust_angle_for_rotation(angle_rad, page_rotation).to_degrees()
         } else {
             0.0
         };
+
+        // Font object for ascent/descent/glyph widths/buggy detection
+        if let Some(obj) = ch.text_object() {
+            if let Some(font) = Font::from_text_object(obj) {
+                if let Some(name) = font.base_name() {
+                    let ft = font.font_type();
+                    self.font_is_embedded = font.is_embedded();
+
+                    if self.font_is_embedded && is_buggy_font(&name, ft) {
+                        self.font_is_buggy = true;
+                    }
+
+                    self.font_name = Some(name);
+                }
+
+                self.font_ascent = font.ascent(self.font_size);
+                self.font_descent = font.descent(self.font_size);
+
+                // Glyph width for first char
+                let char_code = ch.char_code();
+                if let Some(w) = font.glyph_width_from_char_code(char_code, self.font_size) {
+                    self.text_width += w;
+                }
+
+                self.font = Some(font);
+            }
+
+            // fontHeight = fontSize * scaleY
+            if let Some(matrix) = ch.matrix() {
+                let (_sx, sy) = decompose_scale(&matrix);
+                self.font_height = Some(self.font_size * sy);
+            }
+        }
+
+        // Colors from first glyph
+        self.stroke_color = ch.stroke_color().map(|c| color_to_argb_hex(&c));
+        self.fill_color = ch.fill_color().map(|c| color_to_argb_hex(&c));
+
+        // Marked content from first glyph
+        self.mcid = ch.marked_content_id();
+
+        // Check codepoint for buggy encoding
+        let unicode = ch.unicode();
+        if !self.font_is_buggy && self.font_is_embedded && is_buggy_codepoint(unicode) {
+            self.font_is_buggy = true;
+        }
     }
 
     /// Add a visible character to the current segment.
-    fn push_char(&mut self, c: char, cb: &pdfium::CharBox) {
+    fn push_char(&mut self, c: char, vp_loose: &RectF, vp_strict: &RectF, ch: &pdfium::TextChar) {
         self.text.push(c);
-        self.left = self.left.min(cb.left);
-        self.right = self.right.max(cb.right);
-        self.bottom = self.bottom.min(cb.bottom);
-        self.top = self.top.max(cb.top);
-        self.last_char_right = cb.right;
+        self.vp_left = self.vp_left.min(vp_loose.left);
+        self.vp_right = self.vp_right.max(vp_loose.right);
+        self.vp_top = self.vp_top.min(vp_loose.top);
+        self.vp_bottom = self.vp_bottom.max(vp_loose.bottom);
+        self.last_char_right = vp_strict.right;
         self.char_count += 1;
+
+        // Accumulate glyph width
+        if let Some(ref font) = self.font {
+            let char_code = ch.char_code();
+            if ch.is_generated() {
+                if let Some(w) = font.glyph_width(ch.unicode(), self.font_size) {
+                    self.text_width += w;
+                }
+            } else {
+                if let Some(w) = font.glyph_width_from_char_code(char_code, self.font_size) {
+                    self.text_width += w;
+                }
+            }
+        }
+
+        // Check codepoint for buggy encoding on subsequent chars
+        if !self.font_is_buggy && self.font_is_embedded {
+            let unicode = ch.unicode();
+            if is_buggy_codepoint(unicode) {
+                self.font_is_buggy = true;
+            }
+        }
     }
 
-    /// Record that a space was seen; the actual decision to include it
-    /// or to split is deferred until the next visible character.
+    /// Record that a space was seen.
     fn mark_pending_space(&mut self) {
         if self.has_content {
             self.pending_space = true;
@@ -262,29 +438,54 @@ impl SegmentBuilder {
 
         let trimmed = self.text.trim();
         if !trimmed.is_empty() {
-            let height = (self.top - self.bottom) as f32;
+            let width = self.vp_right - self.vp_left;
+            let height = self.vp_bottom - self.vp_top;
+
             items.push(TextItem {
                 text: trimmed.to_string(),
-                x: self.left as f32,
-                y: self.bottom as f32,
-                width: (self.right - self.left) as f32,
+                x: self.vp_left,
+                y: self.vp_top,
+                width,
                 height,
                 rotation: self.rotation_deg,
                 font_name: self.font_name.clone(),
                 font_size: Some(if self.font_size > 0.0 { self.font_size } else { height }),
+                font_height: self.font_height,
+                font_ascent: self.font_ascent,
+                font_descent: self.font_descent,
+                font_weight: self.font_weight,
+                font_flags: self.font_flags,
+                text_width: if self.text_width > 0.0 { Some(self.text_width) } else { None },
+                font_is_buggy: self.font_is_buggy,
+                mcid: self.mcid,
+                fill_color: self.fill_color.clone(),
+                stroke_color: self.stroke_color.clone(),
             });
         }
 
+        // Reset
         self.text.clear();
-        self.left = f64::MAX;
-        self.right = f64::MIN;
-        self.bottom = f64::MAX;
-        self.top = f64::MIN;
-        self.last_char_right = f64::MIN;
+        self.vp_left = f32::MAX;
+        self.vp_right = f32::MIN;
+        self.vp_top = f32::MAX;
+        self.vp_bottom = f32::MIN;
+        self.last_char_right = f32::MIN;
         self.char_count = 0;
         self.font_name = None;
         self.font_size = 0.0;
+        self.font_height = None;
+        self.font_ascent = None;
+        self.font_descent = None;
+        self.font_weight = None;
+        self.font_flags = None;
+        self.font_is_buggy = false;
+        self.font_is_embedded = false;
+        self.font = None;
         self.rotation_deg = 0.0;
+        self.text_width = 0.0;
+        self.mcid = None;
+        self.fill_color = None;
+        self.stroke_color = None;
         self.has_content = false;
         self.pending_space = false;
     }
