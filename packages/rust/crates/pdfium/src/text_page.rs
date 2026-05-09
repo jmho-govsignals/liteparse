@@ -235,6 +235,14 @@ impl TextChar<'_> {
         }
     }
 
+    /// Get text render mode from the page object.
+    /// Returns the raw FPDF_TEXT_RENDERMODE value (0=fill, 1=stroke, 2=fill+stroke, 3=invisible, etc.)
+    pub fn text_render_mode(&self) -> Option<i32> {
+        let obj = self.text_object()?;
+        let mode = unsafe { pdfium_sys::FPDFTextObj_GetTextRenderMode(obj) };
+        if mode >= 0 { Some(mode) } else { None }
+    }
+
     /// Get marked content ID from the page object (-1 if none).
     pub fn marked_content_id(&self) -> Option<i32> {
         let obj = self.text_object()?;

@@ -84,6 +84,12 @@ fn extract_page_text_items(
             continue;
         }
 
+        // Skip invisible text (render mode 3 = invisible).
+        // Some PDFs have hidden text layers (e.g. old branding under new branding).
+        if ch.text_render_mode() == Some(3) {
+            continue;
+        }
+
         // Map to a Rust char, with special-case replacements.
         // Some PDF fonts encode ligatures as control characters; expand them.
         // We use the first char for segment decisions, then append trailing chars.
@@ -202,8 +208,8 @@ fn extract_page_text_items(
     Ok(items)
 }
 
-/// Remove duplicate text items that have the same text and significantly
-/// overlapping bounding boxes.
+/// Remove duplicate text items: exact text matches with any bbox overlap,
+/// and near-duplicates (different text) with high bbox overlap (>50% area).
 fn dedup_overlapping_items(items: &mut Vec<TextItem>) {
     if items.len() < 2 {
         return;
@@ -218,17 +224,36 @@ fn dedup_overlapping_items(items: &mut Vec<TextItem>) {
             if !keep[j] {
                 continue;
             }
-            if items[i].text != items[j].text {
-                continue;
-            }
 
-            // Check bounding box overlap
             let a = &items[i];
             let b = &items[j];
-            let x_overlap = a.x < b.x + b.width && b.x < a.x + a.width;
-            let y_overlap = a.y < b.y + b.height && b.y < a.y + a.height;
-            if x_overlap && y_overlap {
-                keep[j] = false;
+
+            // Compute intersection area
+            let ix_left = a.x.max(b.x);
+            let ix_right = (a.x + a.width).min(b.x + b.width);
+            let iy_top = a.y.max(b.y);
+            let iy_bottom = (a.y + a.height).min(b.y + b.height);
+
+            if ix_left >= ix_right || iy_top >= iy_bottom {
+                continue; // no overlap
+            }
+
+            let intersection = (ix_right - ix_left) * (iy_bottom - iy_top);
+            let area_a = a.width * a.height;
+            let area_b = b.width * b.height;
+            let smaller_area = area_a.min(area_b);
+
+            if items[i].text == items[j].text {
+                // Exact text match: any overlap → drop the earlier item
+                // (later items are rendered on top in PDF paint order)
+                keep[i] = false;
+                break; // i is gone, move to next i
+            } else if smaller_area > 0.0 && intersection / smaller_area > 0.5 {
+                // Different text but >50% overlap of the smaller item:
+                // likely overlapping text layers (e.g. old/new branding).
+                // Keep the later one (rendered on top in PDF paint order).
+                keep[i] = false;
+                break; // i is gone, move to next i
             }
         }
     }
