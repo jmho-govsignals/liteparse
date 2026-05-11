@@ -8,10 +8,14 @@ name = "lit"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.102"
 clap = { version = "4.5.55", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+infer = "0.19.0"
 pdfium = { path = "../pdfium" }
 pdfium-sys = { path = "../pdfium-sys" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+tempfile = "3.27.0"
 tesseract-rs = { version = "0.2", features = ["build-tesseract"] }
+tokio = { version = "1.52.3", features = ["full"] }

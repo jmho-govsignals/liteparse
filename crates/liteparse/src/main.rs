@@ -174,7 +174,8 @@ fn parse_output_format(s: &str) -> Result<OutputFormat, String> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -195,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let lp = LiteParse::new(config);
-            let result = lp.parse(&cmd.file)?;
+            let result = lp.parse(&cmd.file).await?;
             let formatted = lp.format(&result)?;
 
             match cmd.output {
@@ -306,7 +307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::fs::create_dir_all(parent)?;
                 }
 
-                match lp.parse(file_path) {
+                match lp.parse(file_path).await {
                     Ok(result) => match lp.format(&result) {
                         Ok(formatted) => {
                             std::fs::write(&out_path, &formatted)?;

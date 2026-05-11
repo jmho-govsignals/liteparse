@@ -26,7 +26,7 @@ impl LiteParse {
     }
 
     /// Parse a document file, returning structured results.
-    pub fn parse(&self, input: &str) -> Result<ParseResult, Box<dyn std::error::Error>> {
+    pub async fn parse(&self, input: &str) -> Result<ParseResult, Box<dyn std::error::Error>> {
         let log = |msg: &str| {
             if !self.config.quiet {
                 eprintln!("{}", msg);
@@ -37,7 +37,9 @@ impl LiteParse {
         let pdf_path = if conversion::is_pdf(input) {
             input.to_string()
         } else {
-            conversion::convert_to_pdf(input, self.config.password.as_deref())?
+            conversion::convert_to_pdf(input, self.config.password.as_deref())
+                .await?
+                .pdf_path
         };
 
         let t0 = std::time::Instant::now();

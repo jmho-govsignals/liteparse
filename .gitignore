@@ -74,3 +74,4 @@ docs/src/content/docs/liteparse/.api-tmp/
 # Rust
 packages/rust/target/
 packages/rust/vendor/
+target/
