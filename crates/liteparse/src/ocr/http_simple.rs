@@ -43,7 +43,7 @@ impl HttpOcrEngine {
         &self,
         images: Vec<&[u8]>,
         options: OcrOptions,
-    ) -> Result<Vec<Vec<OcrResult>>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Vec<OcrResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut results: Vec<Vec<OcrResult>> = vec![];
         for i in images {
             let result = self.recognize(i, 0, 0, &options)?;
@@ -64,7 +64,7 @@ impl OcrEngine for HttpOcrEngine {
         _width: u32,
         _height: u32,
         options: &OcrOptions,
-    ) -> Result<Vec<OcrResult>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>> {
         let client = Client::new();
         let form = Form::new()
             .part(

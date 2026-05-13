@@ -43,7 +43,7 @@ impl OcrEngine for TesseractOcrEngine {
         width: u32,
         height: u32,
         options: &OcrOptions,
-    ) -> Result<Vec<OcrResult>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>> {
         let language = Self::normalize_language(&options.language);
 
         let api = TesseractAPI::new();

@@ -23,6 +23,8 @@ pub struct LiteParseConfig {
     pub preserve_very_small_text: bool,
     /// Password for encrypted/protected documents.
     pub password: Option<String>,
+    /// Number of OCR worker threads. Defaults to num_cpus - 1 (minimum 1).
+    pub num_workers: usize,
     /// Suppress progress output.
     pub quiet: bool,
 }
@@ -48,6 +50,7 @@ impl Default for LiteParseConfig {
             output_format: OutputFormat::Json,
             preserve_very_small_text: false,
             password: None,
+            num_workers: num_cpus::get().saturating_sub(1).max(1),
             quiet: false,
         }
     }

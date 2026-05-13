@@ -12,6 +12,6 @@ pub use document::Document;
 pub use error::PdfiumError;
 pub use font::{Font, FontType};
 pub use library::Library;
-pub use page::{ImageBounds, Page};
+pub use page::{ImageBounds, Page, ViewportTransform};
 pub use text_page::{TextChar, TextCharIter, TextPage};
 pub use types::*;

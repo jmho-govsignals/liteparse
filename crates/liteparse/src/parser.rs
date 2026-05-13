@@ -90,6 +90,7 @@ impl LiteParse {
                 self.config.dpi,
                 engine.as_ref(),
                 &self.config.ocr_language,
+                self.config.num_workers,
             )?;
         }
         let t_ocr = std::time::Instant::now();

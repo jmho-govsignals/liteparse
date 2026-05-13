@@ -106,6 +106,25 @@ impl Page<'_> {
         }
     }
 
+    /// Create a precomputed viewport transform for this page.
+    /// Use this when converting many points/bounds on the same page to avoid
+    /// redundant rotation lookups and dimension calculations per call.
+    pub fn viewport_transform(&self, view_box: &RectF) -> ViewportTransform {
+        let mut vw = view_box.right - view_box.left;
+        let mut vh = view_box.top - view_box.bottom;
+
+        let rotation = self.rotation();
+        if rotation == 1 || rotation == 3 {
+            std::mem::swap(&mut vw, &mut vh);
+        }
+
+        ViewportTransform {
+            page_handle: self.handle,
+            device_w: (vw * 1000.0).round() as i32,
+            device_h: (vh * 1000.0).round() as i32,
+        }
+    }
+
     pub fn text(&self) -> Result<TextPage<'_>, PdfiumError> {
         let handle = unsafe { pdfium_sys::FPDFText_LoadPage(self.handle) };
         if handle.is_null() {
@@ -230,6 +249,49 @@ impl Page<'_> {
         }
 
         Err(PdfiumError::OperationFailed)
+    }
+}
+
+/// Precomputed viewport transform for a page. Avoids redundant rotation lookups
+/// and dimension calculations when converting many coordinates on the same page.
+pub struct ViewportTransform {
+    page_handle: pdfium_sys::FPDF_PAGE,
+    device_w: i32,
+    device_h: i32,
+}
+
+impl ViewportTransform {
+    #[inline]
+    fn page_to_viewport(&self, page_x: f32, page_y: f32) -> (f32, f32) {
+        let mut dx: i32 = 0;
+        let mut dy: i32 = 0;
+        unsafe {
+            pdfium_sys::FPDF_PageToDevice(
+                self.page_handle,
+                0,
+                0,
+                self.device_w,
+                self.device_h,
+                0,
+                page_x as f64,
+                page_y as f64,
+                &mut dx,
+                &mut dy,
+            );
+        }
+        (dx as f32 / 1000.0, dy as f32 / 1000.0)
+    }
+
+    #[inline]
+    pub fn bounds_to_viewport(&self, page_bounds: &RectF) -> RectF {
+        let (ll_x, ll_y) = self.page_to_viewport(page_bounds.left, page_bounds.bottom);
+        let (ur_x, ur_y) = self.page_to_viewport(page_bounds.right, page_bounds.top);
+        RectF {
+            left: ll_x.min(ur_x),
+            top: ll_y.min(ur_y),
+            right: ll_x.max(ur_x),
+            bottom: ll_y.max(ur_y),
+        }
     }
 }
 

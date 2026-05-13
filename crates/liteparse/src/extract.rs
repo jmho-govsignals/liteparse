@@ -177,13 +177,14 @@ fn extract_page_text_items(
     let skip_invisible = should_skip_invisible(text_page, char_count);
 
     let page_rotation = page.rotation();
+    // Precompute viewport transform to avoid redundant rotation/dimension calculations per character.
+    let vp_transform = page.viewport_transform(view_box);
     let mut items: Vec<TextItem> = Vec::new();
     let mut seg = SegmentBuilder::new();
 
     for i in 0..char_count {
-        let Some(ch) = text_page.char_at(i) else {
-            continue;
-        };
+        // Safety: i is in 0..char_count
+        let ch = unsafe { text_page.char_at_unchecked(i) };
         let unicode = ch.unicode();
         let is_generated = ch.is_generated();
 
@@ -236,7 +237,7 @@ fn extract_page_text_items(
         let Some(loose_box) = ch.loose_char_box() else {
             continue;
         };
-        let vp_loose = page.bounds_to_viewport(view_box, &loose_box);
+        let vp_loose = vp_transform.bounds_to_viewport(&loose_box);
 
         // Skip zero-height characters (phantom dots from dot leader decorations)
         if vp_loose.bottom - vp_loose.top < 0.5 {
@@ -253,7 +254,7 @@ fn extract_page_text_items(
             right: strict_box.right as f32,
             bottom: strict_box.bottom as f32,
         };
-        let vp_strict = page.bounds_to_viewport(view_box, &strict_rect);
+        let vp_strict = vp_transform.bounds_to_viewport(&strict_rect);
 
         if seg.has_content {
             // Use viewport-space coordinates for gap/overlap checks

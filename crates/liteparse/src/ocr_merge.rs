@@ -2,22 +2,37 @@ use crate::ocr::{OcrEngine, OcrOptions};
 use crate::types::{Page, TextItem};
 use image::{ImageBuffer, Rgba};
 use pdfium::Library;
+use rayon::prelude::*;
+
+/// Rendered page image ready for OCR.
+struct RenderedPage {
+    page_index: usize,
+    page_number: usize,
+    rgb_bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+}
 
 /// Run OCR on pages that need it and merge results into text_items.
 ///
 /// OCR is triggered when a page has fewer than 100 characters of native text
-/// or has embedded images.
+/// or has embedded images. Rendering is sequential (PDFium constraint),
+/// but OCR runs in parallel across `num_workers` threads.
 pub fn ocr_and_merge_pages(
     pages: &mut [Page],
     pdf_path: &str,
     dpi: f32,
     ocr_engine: &dyn OcrEngine,
     ocr_language: &str,
+    num_workers: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let lib = Library::init();
     let document = lib.load_document(pdf_path, None)?;
 
-    for page in pages.iter_mut() {
+    // Phase 1: Identify pages needing OCR and render bitmaps (sequential — PDFium is single-threaded)
+    let mut rendered: Vec<RenderedPage> = Vec::new();
+
+    for (page_index, page) in pages.iter().enumerate() {
         let text_length: usize = page.text_items.iter().map(|item| item.text.len()).sum();
         let page_obj = document.page((page.page_number - 1) as i32)?;
         let has_images = !page_obj.image_bounds(25.0, 0.9).is_empty();
@@ -31,7 +46,6 @@ pub fn ocr_and_merge_pages(
             page.page_number, text_length, has_images
         );
 
-        // Render page to raw RGB pixels
         let bitmap = page_obj.render(dpi)?;
         let width = bitmap.width() as u32;
         let height = bitmap.height() as u32;
@@ -43,28 +57,61 @@ pub fn ocr_and_merge_pages(
         let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
         let rgb_bytes = rgb_img.into_raw();
 
-        let options = OcrOptions {
-            language: ocr_language.to_string(),
-        };
+        rendered.push(RenderedPage {
+            page_index,
+            page_number: page.page_number,
+            rgb_bytes,
+            width,
+            height,
+        });
+    }
 
-        let ocr_results = match ocr_engine.recognize(&rgb_bytes, width, height, &options) {
-            Ok(results) => results,
-            Err(e) => {
-                eprintln!("[ocr] failed for page {}: {}", page.page_number, e);
-                continue;
-            }
-        };
+    if rendered.is_empty() {
+        return Ok(());
+    }
 
-        if ocr_results.is_empty() {
+    eprintln!(
+        "[ocr] running OCR on {} pages with {} workers",
+        rendered.len(),
+        num_workers
+    );
+
+    // Phase 2: Run OCR in parallel using rayon thread pool
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_workers)
+        .build()
+        .map_err(|e| format!("failed to create rayon thread pool: {}", e))?;
+
+    let ocr_results: Vec<(usize, usize, Vec<crate::ocr::OcrResult>)> = pool.install(|| {
+        rendered
+            .par_iter()
+            .filter_map(|rp| {
+                let options = OcrOptions {
+                    language: ocr_language.to_string(),
+                };
+                match ocr_engine.recognize(&rp.rgb_bytes, rp.width, rp.height, &options) {
+                    Ok(results) => Some((rp.page_index, rp.page_number, results)),
+                    Err(e) => {
+                        eprintln!("[ocr] failed for page {}: {}", rp.page_number, e);
+                        None
+                    }
+                }
+            })
+            .collect()
+    });
+
+    // Phase 3: Merge OCR results back into pages (sequential)
+    let scale_factor = 72.0 / dpi;
+
+    for (page_index, page_number, results) in ocr_results {
+        if results.is_empty() {
             continue;
         }
 
-        // Scale OCR pixel coordinates to PDF points (72 DPI)
-        let scale_factor = 72.0 / dpi;
-
+        let page = &mut pages[page_index];
         let mut added = 0;
-        for r in &ocr_results {
-            // Filter low confidence
+
+        for r in &results {
             if r.confidence <= 0.1 {
                 continue;
             }
@@ -74,7 +121,6 @@ pub fn ocr_and_merge_pages(
             let ocr_w = (r.bbox[2] - r.bbox[0]) * scale_factor;
             let ocr_h = (r.bbox[3] - r.bbox[1]) * scale_factor;
 
-            // Skip if overlaps with existing PDF text (2pt tolerance)
             if overlaps_existing_text(&page.text_items, ocr_x, ocr_y, ocr_w, ocr_h, 2.0) {
                 continue;
             }
@@ -111,7 +157,7 @@ pub fn ocr_and_merge_pages(
         if added > 0 {
             eprintln!(
                 "[ocr] added {} text items from OCR on page {}",
-                added, page.page_number
+                added, page_number
             );
         }
     }

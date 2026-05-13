@@ -79,6 +79,10 @@ struct ParseCommand {
     #[arg(long)]
     password: Option<String>,
 
+    /// Number of parallel OCR workers (default: num_cpus - 1)
+    #[arg(long)]
+    num_workers: Option<usize>,
+
     /// Suppress progress output
     #[arg(short, long)]
     quiet: bool,
@@ -158,6 +162,10 @@ struct BatchParseCommand {
     #[arg(long)]
     password: Option<String>,
 
+    /// Number of parallel OCR workers (default: num_cpus - 1)
+    #[arg(long)]
+    num_workers: Option<usize>,
+
     /// Suppress progress output
     #[arg(short, long)]
     quiet: bool,
@@ -190,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Parse(cmd) => {
             let format = parse_output_format(&cmd.format)?;
 
+            let default_workers = num_cpus::get().saturating_sub(1).max(1);
             let config = LiteParseConfig {
                 ocr_language: cmd.ocr_language,
                 ocr_enabled: !cmd.no_ocr,
@@ -200,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_format: format,
                 preserve_very_small_text: cmd.preserve_small_text,
                 password: cmd.password,
+                num_workers: cmd.num_workers.unwrap_or(default_workers),
                 quiet: cmd.quiet,
                 ocr_server_url: cmd.ocr_server_url,
             };
@@ -267,6 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
+            let default_workers = num_cpus::get().saturating_sub(1).max(1);
             let config = LiteParseConfig {
                 ocr_language: cmd.ocr_language,
                 ocr_enabled: !cmd.no_ocr,
@@ -277,6 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_format: format.clone(),
                 preserve_very_small_text: false,
                 password: cmd.password,
+                num_workers: cmd.num_workers.unwrap_or(default_workers),
                 quiet: cmd.quiet,
                 ocr_server_url: cmd.ocr_server_url,
             };

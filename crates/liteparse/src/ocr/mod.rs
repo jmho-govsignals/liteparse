@@ -16,7 +16,7 @@ pub struct OcrOptions {
     pub language: String,
 }
 
-pub trait OcrEngine {
+pub trait OcrEngine: Send + Sync {
     fn name(&self) -> &str;
     fn recognize(
         &self,
@@ -24,5 +24,5 @@ pub trait OcrEngine {
         width: u32,
         height: u32,
         options: &OcrOptions,
-    ) -> Result<Vec<OcrResult>, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>;
 }

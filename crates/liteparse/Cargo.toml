@@ -24,6 +24,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 infer = "0.19.0"
 pdfium = { package = "liteparse-pdfium", version = "1.0.0", path = "../pdfium" }
 pdfium-sys = { package = "liteparse-pdfium-sys", version = "1.0.0", path = "../pdfium-sys" }
+num_cpus = "1.16"
+rayon = "1.10"
 reqwest = { version = "0.13.3", features = ["blocking", "json", "form", "multipart"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
