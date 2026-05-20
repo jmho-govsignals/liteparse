@@ -8,7 +8,7 @@
 pub use config::{LiteParseConfig, OutputFormat};
 pub use error::LiteParseError;
 pub use parser::{LiteParse, ParseResult};
-pub use search::{search_items, SearchOptions};
+pub use search::{SearchOptions, search_items};
 pub use types::{ParsedPage, TextItem};
 
 // ── Modules with user-facing types (visible in docs) ───────────────────

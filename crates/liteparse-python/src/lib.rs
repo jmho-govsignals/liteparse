@@ -56,7 +56,7 @@ impl PyTextItem {
         }
     }
 
-    fn from_rust(item: &liteparse::types::TextItem) -> Self {
+    fn from_rust(item: liteparse::types::TextItem) -> Self {
         Self {
             text: item.text,
             x: item.x as f64,
@@ -384,7 +384,7 @@ fn search_items(items: Vec<PyTextItem>, phrase: String, case_sensitive: bool) ->
         case_sensitive,
     };
     liteparse::search::search_items(&rust_items, &options)
-        .iter()
+        .into_iter()
         .map(PyTextItem::from_rust)
         .collect()
 }
