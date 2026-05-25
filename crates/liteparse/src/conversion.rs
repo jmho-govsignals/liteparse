@@ -381,23 +381,37 @@ pub async fn convert_office_document(
     args.push(file_path);
 
     execute_command(&libre_office_cmd, args, 120_000).await?;
+    find_pdf_in_dir(output_dir).await
+}
 
-    let base_name = Path::new(file_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| LiteParseError::Conversion(format!("invalid file path: {file_path}")))?;
-    let pdf_path = Path::new(output_dir)
-        .join(format!("{base_name}.pdf"))
-        .to_string_lossy()
-        .to_string();
-
-    if tokio::fs::metadata(&pdf_path).await.is_ok() {
-        Ok(pdf_path)
-    } else {
-        Err(LiteParseError::Conversion(
-            "LibreOffice conversion succeeded but output PDF not found".into(),
-        ))
+/// Scan `output_dir` for the first `.pdf` file and return its path.
+///
+/// LibreOffice sanitises filenames during conversion (e.g. strips parentheses,
+/// leading digit sequences, spaces) so the output PDF stem often differs from
+/// the input file stem.  Since `output_dir` is always a fresh temp directory
+/// that holds exactly one file after a successful conversion, scanning for any
+/// `.pdf` entry is more robust than constructing a fixed `<stem>.pdf` path.
+async fn find_pdf_in_dir(output_dir: &str) -> Result<String, LiteParseError> {
+    let mut read_dir = tokio::fs::read_dir(output_dir)
+        .await
+        .map_err(|e| LiteParseError::Conversion(format!("cannot read output dir: {e}")))?;
+    while let Some(entry) = read_dir
+        .next_entry()
+        .await
+        .map_err(|e| LiteParseError::Conversion(format!("error reading output dir: {e}")))?
+    {
+        let path = entry.path();
+        if path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("pdf"))
+            .unwrap_or(false)
+        {
+            return Ok(path.to_string_lossy().to_string());
+        }
     }
+    Err(LiteParseError::Conversion(
+        "LibreOffice conversion succeeded but output PDF not found".into(),
+    ))
 }
 
 /// Convert images to PDF using ImageMagick.
@@ -606,5 +620,48 @@ mod tests {
         let r = convert_to_pdf("/some/file.xyz", None, false).await;
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("unsupported"));
+    }
+
+    // ── find_pdf_in_dir ──────────────────────────────────────────────────────
+
+    /// Regression test for the LibreOffice filename-sanitisation bug.
+    ///
+    /// LibreOffice strips characters like parentheses and leading digit
+    /// sequences from filenames, so the output PDF stem often differs from the
+    /// input file stem.  `find_pdf_in_dir` must locate the PDF regardless of
+    /// what LibreOffice chose to call it.
+    ///
+    /// Scenario: input was `52304751_AnuragLahare_E2 (1).docx`; LibreOffice
+    /// wrote `AnuragLahare_E2_1_.pdf` instead of the expected
+    /// `52304751_AnuragLahare_E2 (1).pdf`.
+    #[tokio::test]
+    async fn test_find_pdf_in_dir_returns_sanitised_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Simulate LibreOffice writing a sanitised filename.
+        let sanitised = tmp.path().join("AnuragLahare_E2_1_.pdf");
+        tokio::fs::write(&sanitised, b"%PDF-1.4").await.unwrap();
+
+        let result = find_pdf_in_dir(tmp.path().to_str().unwrap()).await;
+        assert!(result.is_ok(), "should find PDF even with sanitised name");
+        assert!(
+            result.unwrap().ends_with("AnuragLahare_E2_1_.pdf"),
+            "returned path should point to the sanitised file"
+        );
+    }
+
+    /// When LibreOffice somehow produces no PDF (unexpected failure), the
+    /// helpful error message must still be returned.
+    #[tokio::test]
+    async fn test_find_pdf_in_dir_empty_dir_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = find_pdf_in_dir(tmp.path().to_str().unwrap()).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("output PDF not found"),
+            "error message should mention missing PDF"
+        );
     }
 }
