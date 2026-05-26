@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.104.1",
-    "pillow>=10.0.0",
+    "pillow>=12.2.0",
     "pymupdf>=1.27.2",
     "pymupdf4llm>=1.27.2",
     "pypdf>=6.12.1",
