@@ -109,15 +109,35 @@ pub(crate) async fn ocr_and_merge_rendered(
     // Phase 3: collect results and merge into pages.
     let scale_factor = 72.0 / dpi;
 
+    // Track OCR task outcomes so we can distinguish a systemic failure (e.g.
+    // missing Tesseract language data, which fails identically on every page)
+    // from incidental per-page failures. Without this, every page logs the same
+    // error and `parse()` still returns "success" with no OCR text.
+    let total_tasks = handles.len();
+    let mut failed_tasks = 0usize;
+    let mut first_error: Option<String> = None;
+
     for (idx, page_number, handle) in handles {
         let ocr_results: Vec<OcrResult> = match handle.await {
             Ok(Ok(results)) => results,
             Ok(Err(e)) => {
-                eprintln!("[ocr] failed for page {}: {}", page_number, e);
+                failed_tasks += 1;
+                // Only log the first failure to avoid flooding stderr with an
+                // identical message for every page.
+                if first_error.is_none() {
+                    let msg = e.to_string();
+                    eprintln!("[ocr] failed for page {}: {}", page_number, msg);
+                    first_error = Some(msg);
+                }
                 continue;
             }
             Err(e) => {
-                eprintln!("[ocr] task panicked for page {}: {}", page_number, e);
+                failed_tasks += 1;
+                if first_error.is_none() {
+                    let msg = e.to_string();
+                    eprintln!("[ocr] task panicked for page {}: {}", page_number, msg);
+                    first_error = Some(msg);
+                }
                 continue;
             }
         };
@@ -158,6 +178,26 @@ pub(crate) async fn ocr_and_merge_rendered(
                 ..Default::default()
             });
         }
+    }
+
+    // If every OCR task failed and there was at least one task, treat it as a
+    // systemic failure (e.g. missing language data / Tesseract init error)
+    // rather than silently returning a document with no OCR text. This surfaces
+    // the root cause to the caller instead of swallowing it page-by-page.
+    if total_tasks > 0 && failed_tasks == total_tasks {
+        let detail = first_error.unwrap_or_else(|| "unknown error".to_string());
+        return Err(LiteParseError::Ocr(format!(
+            "OCR failed for all {} page(s): {}",
+            total_tasks, detail
+        )));
+    }
+
+    // Surface a concise summary for partial failures without flooding stderr.
+    if failed_tasks > 0 {
+        eprintln!(
+            "[ocr] {}/{} page(s) failed OCR; continuing with partial results",
+            failed_tasks, total_tasks
+        );
     }
 
     Ok(())
@@ -277,5 +317,83 @@ mod tests {
     fn test_clean_ocr_keeps_whitespace_trimmed() {
         assert_eq!(clean_ocr_table_artifacts("   "), "");
         assert_eq!(clean_ocr_table_artifacts(" 123 "), "123");
+    }
+
+    // A mock OCR engine that always fails, simulating a systemic error such as
+    // missing Tesseract language data (the root cause behind issue #253).
+    struct FailingEngine;
+    impl OcrEngine for FailingEngine {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn recognize<'a, 'b: 'a, 'c: 'a>(
+            &'a self,
+            _image_data: &'c [u8],
+            _width: u32,
+            _height: u32,
+            _options: &'b OcrOptions,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move { Err("Error opening data file tessdata/eng.traineddata".into()) })
+        }
+    }
+
+    fn make_blank_page(page_number: usize) -> Page {
+        Page {
+            page_number,
+            page_width: 100.0,
+            page_height: 100.0,
+            text_items: Vec::new(),
+        }
+    }
+
+    fn make_rendered(idx: usize) -> RenderedPage {
+        RenderedPage {
+            idx,
+            // 1x1 RGB pixel; the engine never inspects it.
+            rgb_bytes: vec![0u8, 0u8, 0u8],
+            width: 1,
+            height: 1,
+        }
+    }
+
+    // When every OCR task fails (e.g. missing language data), the function must
+    // return an error instead of silently reporting success with no OCR text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_all_pages_fail_returns_error() {
+        let mut pages = vec![make_blank_page(1), make_blank_page(2)];
+        let rendered = vec![make_rendered(0), make_rendered(1)];
+        let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
+
+        let result = ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2).await;
+
+        let err = result.expect_err("expected systemic OCR failure to be surfaced");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OCR failed for all 2 page(s)"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("traineddata"),
+            "error should carry the underlying cause: {msg}"
+        );
+    }
+
+    // With no rendered pages there is nothing to OCR; this must remain a no-op
+    // success rather than tripping the all-failed guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_rendered_pages_is_ok() {
+        let mut pages = vec![make_blank_page(1)];
+        let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
+
+        let result = ocr_and_merge_rendered(&mut pages, Vec::new(), 72.0, engine, "eng", 2).await;
+
+        assert!(result.is_ok(), "empty OCR set should succeed: {result:?}");
     }
 }
