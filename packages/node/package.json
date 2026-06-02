@@ -22,7 +22,8 @@
       "defaults": true,
       "additional": [
         "aarch64-apple-darwin",
-        "aarch64-unknown-linux-gnu"
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl"
       ]
     }
   },
@@ -31,6 +32,7 @@
     "*.node",
     "*.dylib",
     "*.so",
+    "*.so.*",
     "*.dll",
     "README.md",
     "LICENSE"
@@ -57,6 +59,7 @@
     "@llamaindex/liteparse-linux-x64-gnu": "2.0.4",
     "@llamaindex/liteparse-win32-arm64-msvc": "2.0.4",
     "@llamaindex/liteparse-win32-x64-msvc": "2.0.4"
+    "@llamaindex/liteparse-linux-x64-musl": "2.0.4"
   },
   "engines": {
     "node": ">=18.0.0"
