@@ -57,7 +57,7 @@
     "@llamaindex/liteparse-linux-arm64-gnu": "2.0.4",
     "@llamaindex/liteparse-linux-x64-gnu": "2.0.4",
     "@llamaindex/liteparse-win32-x64-msvc": "2.0.4",
-    "@llamaindex/liteparse-linux-x64-musl": "2.0.4",
+    "@llamaindex/liteparse-linux-x64-musl": "2.0.4"
   },
   "engines": {
     "node": ">=18.0.0"
