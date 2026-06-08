@@ -22,6 +22,7 @@ use super::tables::{detect_ruled_tables, detect_tables, merge_table_runs};
 /// image ref). Collected into one y-sorted stream so the two kinds interleave
 /// correctly by vertical position rather than emitting all of one before the
 /// other.
+#[derive(Clone)]
 enum Interruption {
     Hr,
     Figure(crate::types::ImageRef),
@@ -69,43 +70,6 @@ pub fn classify_page_with_filters(
     image_mode: crate::config::ImageMode,
     chrome_indices: &std::collections::HashSet<usize>,
 ) -> Vec<Block> {
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut paragraph: Option<ParaAccum> = None;
-    // Active fenced code block being accumulated (consecutive `all_mono` lines).
-    let mut code: Option<Vec<String>> = None;
-    // Tracks the "level 0" indent of the current contiguous list run so we can
-    // bucket deeper items into nesting levels. Reset whenever a non-list block
-    // breaks the run.
-    let mut list_base_indent: Option<f32> = None;
-    // Index into `blocks` of the most recent ListItem in the current run — used
-    // to merge wrapped continuation lines into the same item.
-    let mut last_list_item_idx: Option<usize> = None;
-    // Index (into `lines`) of the most recent line appended to the active list
-    // item, for gap/font-size checks on continuation lines. An index rather than
-    // a cloned line so the per-line hot loop doesn't deep-copy `spans` each time.
-    let mut last_list_line: Option<usize> = None;
-    // (level, last line) of a heading block currently being accumulated. Lets a
-    // multi-line wrapped heading/caption (e.g. a photo caption set one size
-    // above body) merge into one Heading block instead of shredding into one
-    // `###` per wrapped line. Adjacency is enforced by checking `blocks.last()`,
-    // so this never reaches across an intervening block.
-    let mut heading_run: Option<(u8, usize)> = None;
-
-    let flush_paragraph = |blocks: &mut Vec<Block>, p: Option<ParaAccum>| {
-        if let Some(acc) = p
-            && !acc.raw.trim().is_empty()
-        {
-            blocks.push(paragraph_from_accum(acc));
-        }
-    };
-    let flush_code = |blocks: &mut Vec<Block>, c: Option<Vec<String>>| {
-        if let Some(lines) = c
-            && !lines.is_empty()
-        {
-            blocks.push(Block::CodeBlock { lines });
-        }
-    };
-
     let debug = std::env::var("LITEPARSE_DEBUG_MD").is_ok();
 
     // TOC suppression: when ≥3 lines on this page look like TOC entries
@@ -138,27 +102,174 @@ pub fn classify_page_with_filters(
         &filtered_owned
     };
 
-    // Pre-pass: detect tabular regions so the per-line classifier below can
-    // skip over them. Tables take priority over heading / paragraph / list
-    // classification because a row of bold short cells would otherwise be
-    // misread as a heading or list item.
-    //
-    // Two detectors run in sequence: ruled-grid (path-based, strongest signal)
-    // and the borderless column-alignment fallback. Where ranges overlap, the
-    // ruled output wins.
+    // Region-grouped pipeline: split the filtered line list into contiguous
+    // runs sharing a `region_path` (one xy_cut leaf each) and classify each
+    // leaf as its own mini-page. Paragraph / list / code / heading state is
+    // scoped per leaf so a column-wrap can't silently fuse two leaves into one
+    // paragraph, and table detection runs per-leaf so a misfired borderless
+    // table can't consume lines from a different leaf (the dominant Mode 15
+    // cause: a spurious table starting in one column's footnote area was
+    // eating the first lines of the next column, dropping those words from
+    // any block). Cross-leaf merges happen only in `stitch_regions` at the
+    // end, where the rule is explicit and inspectable.
+    let mut region_ranges: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut s = 0;
+        while s < lines.len() {
+            let path = &lines[s].region_path;
+            let mut e = s + 1;
+            while e < lines.len() && lines[e].region_path == *path {
+                e += 1;
+            }
+            region_ranges.push((s, e));
+            s = e;
+        }
+    }
+
+    // Page-level interruptions (HRs from vector graphics + figure refs) need
+    // to interleave with text by y-position. Collect once, then dispatch into
+    // each region's classify call by y-band so they emit in the right slot.
+    // Two interruptions belonging to *no* region (e.g. an HR in a margin band
+    // that no leaf covers) are emitted between regions in y order.
+    let mut all_interruptions: Vec<(f32, Interruption)> = detect_horizontal_rules(page)
+        .into_iter()
+        .map(|y| (y, Interruption::Hr))
+        .collect();
+    if !matches!(image_mode, crate::config::ImageMode::Off) {
+        for r in &page.image_refs {
+            all_interruptions.push((r.bbox.y, Interruption::Figure(r.clone())));
+        }
+    }
+    all_interruptions.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    // region_boundary_idx[k] = index into `blocks` where region k's first
+    // block lives. Used by `stitch_regions` to know where to test cross-leaf
+    // paragraph continuation. Stored alongside the region's last line so the
+    // stitcher can use the same `continues_paragraph` cross-region rule that
+    // governs intra-region merging — no second source of truth.
+    let mut region_boundaries: Vec<usize> = Vec::new();
+    let mut interrupt_cursor = 0usize;
+    let mut blocks: Vec<Block> = Vec::new();
+
+    let push_interruption = |blocks: &mut Vec<Block>, kind: Interruption| {
+        blocks.push(match kind {
+            Interruption::Hr => Block::HorizontalRule,
+            Interruption::Figure(r) => Block::Figure {
+                id: r.id,
+                bbox: r.bbox,
+            },
+        });
+    };
+
+    for (rstart, rend) in region_ranges {
+        let region_lines = &lines[rstart..rend];
+
+        // Compute this region's y-extent so we can slot in interruptions that
+        // fall above or inside it. xy_cut leaves are rectangular partitions,
+        // so a leaf's y-band is well-defined.
+        let mut y_min = f32::INFINITY;
+        let mut y_max = f32::NEG_INFINITY;
+        for l in region_lines {
+            y_min = y_min.min(l.bbox.y);
+            y_max = y_max.max(l.bbox.y + l.bbox.height);
+        }
+
+        // Emit any interruptions that sit above this region's top edge before
+        // we start emitting the region's own blocks.
+        while interrupt_cursor < all_interruptions.len()
+            && all_interruptions[interrupt_cursor].0 < y_min
+        {
+            let (_, kind) = all_interruptions[interrupt_cursor].clone();
+            push_interruption(&mut blocks, kind);
+            interrupt_cursor += 1;
+        }
+
+        // Hand the region its in-band interruptions (y in [y_min, y_max]) so
+        // the per-line loop can interleave them by y, matching the old
+        // page-level behavior within a leaf.
+        let mut region_interruptions: Vec<(f32, Interruption)> = Vec::new();
+        while interrupt_cursor < all_interruptions.len()
+            && all_interruptions[interrupt_cursor].0 <= y_max
+        {
+            region_interruptions.push(all_interruptions[interrupt_cursor].clone());
+            interrupt_cursor += 1;
+        }
+
+        let region_start = blocks.len();
+        let region_blocks = classify_region(
+            region_lines,
+            region_interruptions,
+            page,
+            heading_map,
+            outline,
+            image_mode,
+            toc_page,
+            debug,
+        );
+        if !region_blocks.is_empty() {
+            region_boundaries.push(region_start);
+            blocks.extend(region_blocks);
+        }
+    }
+
+    // Trailing interruptions below the last region.
+    while interrupt_cursor < all_interruptions.len() {
+        let (_, kind) = all_interruptions[interrupt_cursor].clone();
+        push_interruption(&mut blocks, kind);
+        interrupt_cursor += 1;
+    }
+
+    return stitch_regions(blocks, &region_boundaries);
+}
+
+/// Classify the lines of a single xy_cut leaf into a sequence of blocks. All
+/// per-line state (active paragraph, code run, list run, heading_run) is local
+/// to this call — nothing crosses a leaf boundary except through the explicit
+/// `stitch_regions` post-pass. Page-level signals (`heading_map`,
+/// `struct_nodes`, `outline`, header/footer y-bands) are still consulted
+/// because they're computed once per document.
+fn classify_region(
+    lines: &[ProjectedLine],
+    interruptions: Vec<(f32, Interruption)>,
+    page: &ParsedPage,
+    heading_map: &[(f32, u8)],
+    outline: &[OutlineTarget],
+    image_mode: crate::config::ImageMode,
+    toc_page: bool,
+    debug: bool,
+) -> Vec<Block> {
+    let _ = image_mode; // interruption emission already gated upstream
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut paragraph: Option<ParaAccum> = None;
+    let mut code: Option<Vec<String>> = None;
+    let mut list_base_indent: Option<f32> = None;
+    let mut last_list_item_idx: Option<usize> = None;
+    let mut last_list_line: Option<usize> = None;
+    let mut heading_run: Option<(u8, usize)> = None;
+
+    let flush_paragraph = |blocks: &mut Vec<Block>, p: Option<ParaAccum>| {
+        if let Some(acc) = p
+            && !acc.raw.trim().is_empty()
+        {
+            blocks.push(paragraph_from_accum(acc));
+        }
+    };
+    let flush_code = |blocks: &mut Vec<Block>, c: Option<Vec<String>>| {
+        if let Some(lines) = c
+            && !lines.is_empty()
+        {
+            blocks.push(Block::CodeBlock { lines });
+        }
+    };
+
+    // Per-region table detection. Indices are local to `lines`. Page-level
+    // graphics are still consulted for ruled-table detection because path
+    // objects are page-coordinate; the detector intersects them against the
+    // sub-list's line bboxes anyway.
     let ruled_runs = detect_ruled_tables(lines, &page.graphics, page.page_width, page.page_height);
     let borderless_runs = detect_tables(lines);
     let table_runs = merge_table_runs(ruled_runs, borderless_runs);
 
-    // Suppress HRs that fall inside a detected table's y-range — they're the
-    // table's own row dividers, not document-level section breaks. Build the
-    // y-extents once before we move table_runs into the iterator.
-    // Extend each table's HR-suppression band upward to cover any
-    // header/sub-header rows we didn't absorb into the table. The expansion
-    // is a few row heights — large enough to catch a 2–3 line bold/italic
-    // header sitting just above the table, small enough not to swallow a
-    // real section divider belonging to a different block. The downward
-    // edge gets a small slack to catch HRs drawn flush with the last row.
     const TABLE_HR_SUPPRESS_HEADROOM_ROWS: f32 = 4.0;
     let table_y_extents: Vec<(f32, f32)> = table_runs
         .iter()
@@ -174,34 +285,17 @@ pub fn classify_page_with_filters(
 
     let mut table_iter = table_runs.into_iter().peekable();
 
-    // Pre-pass: collect document-order "interruptions" — horizontal rules
-    // (from vector graphics) and figure injections (raster image refs when
-    // image mode is on) — into one y-sorted stream. Emitting them from a single
-    // stream keeps HRs and figures correctly interleaved by y; a per-type pass
-    // would emit all HRs before all figures regardless of vertical position.
-    // Both are suppressed inside table y-extents so a row divider or a
-    // cell-spanning raster background doesn't spawn a block mid-table.
     let in_table_band = |y: f32| {
         table_y_extents
             .iter()
             .any(|(top, bot)| y >= *top - 2.0 && y <= *bot + 2.0)
     };
-    let mut interruptions: Vec<(f32, Interruption)> = detect_horizontal_rules(page)
+    let mut region_interruptions: Vec<(f32, Interruption)> = interruptions
         .into_iter()
-        .filter(|y| !in_table_band(*y))
-        .map(|y| (y, Interruption::Hr))
+        .filter(|(y, _)| !in_table_band(*y))
         .collect();
-    if !matches!(image_mode, crate::config::ImageMode::Off) {
-        for r in &page.image_refs {
-            if !in_table_band(r.bbox.y) {
-                interruptions.push((r.bbox.y, Interruption::Figure(r.clone())));
-            }
-        }
-    }
-    // Stable sort by y. HRs were pushed before figures, so an exact-y tie keeps
-    // the prior HR-before-figure ordering.
-    interruptions.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut interruptions = interruptions.into_iter().peekable();
+    region_interruptions.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut interruptions = region_interruptions.into_iter().peekable();
 
     // Emit any interruptions whose y is at or above `before_y`, flushing the
     // active paragraph/code/list state first so each lands as its own block.
@@ -551,6 +645,92 @@ pub fn classify_page_with_filters(
         f32::INFINITY,
     );
     blocks
+}
+
+/// Cross-region merging. Walks the concatenated block stream and, at each
+/// region boundary, tries to fuse the last block of region A with the first
+/// block of region B when they represent one logical unit split across leaves.
+/// This is the *only* place per-region scoping is relaxed — every other
+/// detector now treats a region as a hard wall — so the merge rules here are
+/// deliberately narrow and inspectable.
+///
+/// Currently supports:
+/// - **Paragraph → Paragraph**: same cross-region rule as
+///   `continues_paragraph`'s `region_path != region_path` arm: the previous
+///   paragraph ends mid-sentence (no terminal punctuation) and the next
+///   starts lowercase. Heals the dominant Mode 15 shape (column wrap losing
+///   its tail to a separate block).
+/// - **Hyphen splice**: previous paragraph ends `<letter>-` and next starts
+///   ASCII-lowercase. Already handled in `render_blocks` for the adjacent
+///   case, but doing it here too lets the merged block flow through the
+///   uniform paragraph-rendering path and avoids a `\n\n` slipping in when
+///   the renderer sees an intervening non-paragraph block.
+///
+/// Lists, code blocks, headings, and tables are *not* fused across regions
+/// in v1. A bullet point split across columns is rare and a false merge is
+/// worse than a true split; a table split across leaves indicates a
+/// projection-side issue better fixed there than papered over here.
+fn stitch_regions(blocks: Vec<Block>, region_starts: &[usize]) -> Vec<Block> {
+    if region_starts.len() <= 1 {
+        return blocks;
+    }
+    let boundary_set: std::collections::HashSet<usize> =
+        region_starts.iter().skip(1).copied().collect();
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    for (i, block) in blocks.into_iter().enumerate() {
+        if boundary_set.contains(&i)
+            && let Some(prev) = out.last_mut()
+            && let (
+                Block::Paragraph {
+                    text: prev_text, ..
+                },
+                Block::Paragraph {
+                    text: cur_text,
+                    bold: false,
+                    italic: false,
+                },
+            ) = (prev, &block)
+        {
+            let prev_trim = prev_text.trim_end();
+            let starts_lower = cur_text
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_lowercase());
+            // Hyphen-splice path: bare `<letter>-` mid-word break across the
+            // leaf boundary. Drop the hyphen, join with no separator.
+            let hyphen_splice = prev_trim.ends_with('-')
+                && prev_trim
+                    .chars()
+                    .rev()
+                    .nth(1)
+                    .is_some_and(|c| c.is_ascii_alphabetic())
+                && starts_lower;
+            if hyphen_splice {
+                // Pop the trailing `-` (it may have whitespace after it from
+                // a previous trim, so re-trim).
+                while prev_text.ends_with(|c: char| c.is_whitespace()) {
+                    prev_text.pop();
+                }
+                prev_text.pop(); // the '-'
+                prev_text.push_str(cur_text.trim_start());
+                continue;
+            }
+            let ends_open = !prev_trim.ends_with(|c: char| {
+                matches!(
+                    c,
+                    '.' | '!' | '?' | ':' | ';' | '”' | '"' | ')' | ']' | '。' | '』' | '」'
+                )
+            });
+            if ends_open && starts_lower {
+                prev_text.push(' ');
+                prev_text.push_str(cur_text.trim_start());
+                continue;
+            }
+        }
+        out.push(block);
+    }
+    out
 }
 
 #[cfg(test)]

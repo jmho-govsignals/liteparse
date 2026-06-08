@@ -574,7 +574,11 @@ fn extract_page_text_items(
                     gap,
                     loose_gap,
                     space_w,
-                    if space_w > 0.0 { loose_gap / space_w } else { 0.0 },
+                    if space_w > 0.0 {
+                        loose_gap / space_w
+                    } else {
+                        0.0
+                    },
                     fs,
                     if fs > 0.0 { gap / fs } else { 0.0 },
                     seg.avg_char_width(),
@@ -613,7 +617,11 @@ fn extract_page_text_items(
                 let space_w = ch.font_space_width().map(|w| w * em_vp).unwrap_or(0.0);
                 let loose_gap = vp_strict.left - seg.last_char_loose_right;
                 let both_alnum = c.is_ascii_alphanumeric()
-                    && seg.text.chars().last().is_some_and(|p| p.is_ascii_alphanumeric());
+                    && seg
+                        .text
+                        .chars()
+                        .last()
+                        .is_some_and(|p| p.is_ascii_alphanumeric());
                 let thresh = if space_w > 0.0 {
                     0.7 * space_w
                 } else {
@@ -691,12 +699,43 @@ fn dedup_overlapping_items(items: &mut Vec<TextItem>, debug: bool) {
             let smaller_area = area_a.min(area_b);
 
             if items[i].text == items[j].text {
-                // Exact text match: any overlap → drop the earlier item
-                // (later items are rendered on top in PDF paint order)
+                // Exact text match: require strong bounding-box overlap before
+                // dedup. Originally this fired on *any* overlap on the theory
+                // that overlapping identical text is two layers of the same
+                // content (re-stamped redactions, etc). But the same word
+                // routinely appears more than once on a page in different
+                // positions; if the items' bboxes happen to share even a sliver
+                // of area (e.g. one column's word vertically adjacent to
+                // another column's identical word with a slack loose-box), we
+                // were silently dropping the legitimate first occurrence.
+                //
+                // Reproducer: olmocr 0083fb21…page_8 — column 1 has the word
+                // "source" in row 2 and again in row 3; the dedup nuked the
+                // row 2 "source" in favor of the row 3 one (which later merged
+                // into "source income is reduced (the"), making the row 2
+                // sentence read as "made to U.S. \n . In situations…" with
+                // "source income" missing.
+                //
+                // Require ≥50% overlap of the smaller item — same threshold
+                // as the non-exact branch. True duplicate stamps overlap
+                // essentially 100%; unrelated repeats overlap 0%.
+                let strong_overlap = smaller_area > 0.0 && intersection / smaller_area > 0.5;
+                if !strong_overlap {
+                    continue;
+                }
                 if debug {
                     eprintln!(
-                        "[extract-debug] DEDUP exact-match drop i={i} text='{}' at ({:.1},{:.1}) in favor of j={j} at ({:.1},{:.1})",
-                        items[i].text, items[i].x, items[i].y, items[j].x, items[j].y
+                        "[extract-debug] DEDUP exact-match drop i={i} text='{}' at ({:.1},{:.1} {}x{}) in favor of j={j} at ({:.1},{:.1} {}x{}) overlap_ratio={:.2}",
+                        items[i].text,
+                        items[i].x,
+                        items[i].y,
+                        items[i].width,
+                        items[i].height,
+                        items[j].x,
+                        items[j].y,
+                        items[j].width,
+                        items[j].height,
+                        intersection / smaller_area
                     );
                 }
                 keep[i] = false;

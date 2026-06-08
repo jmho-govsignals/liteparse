@@ -3885,32 +3885,138 @@ fn xy_cut_rec(
         let mut right: Vec<usize> = Vec::new();
         // Column-histogram V-cuts (score = 1.0e9) split between two column
         // left-edge clusters. The cut sits at the midpoint between the two
-        // peak x's, which is typically far inside the left column — a wide
-        // body line whose left half wraps to a second item starting before
-        // the column's right edge can have a centroid past the cut, which
-        // would mis-route it to the right column. Partition by left edge
-        // for these cuts: the item's column membership is determined by
-        // which peak its starting x is closer to, not by its midpoint.
-        // Density V-cuts (white-space valleys) split between physical
-        // text-free space — items truly straddle the cut only when wider
-        // than the column, and centroid is the right discriminator there.
+        // peak x's, which is typically far inside the left column. PDFium
+        // routinely emits a single visual line as multiple items (line-start
+        // + mid-line emphasis fragments + late-line clusters); each item has
+        // its own x, so an item-by-item partition by `it.x` will split one
+        // logical line across both sides whenever a continuation fragment
+        // starts past `cut.position`. Verified on `031a888e…page_1` where
+        // a histogram V-cut at x=360.8 inside column 2 routed the body-start
+        // fragments at x=312 LEFT but their same-baseline continuation
+        // "In Section 2 the" at x=474 RIGHT, orphaning the snippet from its
+        // paragraph and producing a stranded block downstream.
+        //
+        // Fix: for histogram V-cuts, first measure how many y-bands have items
+        // on *both* sides of the cut ("straddling rows"). A real column
+        // boundary has every body row straddling (text in left + right column
+        // on the same baseline) — partition by `it.x` so each column gets its
+        // items. An intra-column histogram split (031a888e case: a single line
+        // wrapped into multiple items at different x's) has almost no
+        // straddling rows — partition by row leftmost-x so a wrapped line
+        // stays whole. The threshold (>~25% of rows straddle) cleanly
+        // separates: 0145bc47 (every body row straddles, ~100%) gets per-item
+        // partition; 031a888e (1 of ~45 rows straddles, ~2%) gets per-row.
+        //
+        // Density V-cuts (white-space valleys) still use centroid: they only
+        // fire where a real text-free vertical band exists, so an item that
+        // crosses a density cut is genuinely wider than the column.
         let is_histogram_v_cut = cut.axis == CutAxis::Vertical && (cut.score - 1.0e9).abs() < 1.0;
-        for &i in &idxs {
-            let it = &items[i].item;
-            let split_at = match cut.axis {
-                CutAxis::Horizontal => it.y + it.height.max(0.0) * 0.5,
-                CutAxis::Vertical => {
-                    if is_histogram_v_cut {
-                        it.x
-                    } else {
-                        it.x + it.width.max(0.0) * 0.5
+        if is_histogram_v_cut {
+            // Sort by y then x so items on one baseline cluster together.
+            let mut sorted_idxs: Vec<usize> = idxs.clone();
+            sorted_idxs.sort_by(|&a, &b| {
+                items[a]
+                    .item
+                    .y
+                    .total_cmp(&items[b].item.y)
+                    .then(items[a].item.x.total_cmp(&items[b].item.x))
+            });
+            let band_tol = (median_h * 0.5).max(2.0);
+
+            // First pass: count rows with items entirely-left, entirely-right,
+            // or straddling the cut. Decides the partition strategy.
+            let (mut rows_total, mut rows_straddle) = (0usize, 0usize);
+            let mut k = 0;
+            while k < sorted_idxs.len() {
+                let band_y = items[sorted_idxs[k]].item.y;
+                let mut j = k;
+                let mut has_left = false;
+                let mut has_right = false;
+                while j < sorted_idxs.len()
+                    && (items[sorted_idxs[j]].item.y - band_y).abs() <= band_tol
+                {
+                    let ix = items[sorted_idxs[j]].item.x;
+                    if ix.is_finite() {
+                        if ix < cut.position {
+                            has_left = true;
+                        } else {
+                            has_right = true;
+                        }
+                    }
+                    j += 1;
+                }
+                if has_left || has_right {
+                    rows_total += 1;
+                    if has_left && has_right {
+                        rows_straddle += 1;
                     }
                 }
-            };
-            if split_at < cut.position {
-                left.push(i);
+                k = j;
+            }
+            // 25% threshold: when a quarter or more of rows have content on
+            // both sides of the cut, it's a real column boundary (every body
+            // row has text in both columns). Below that, the cut sits inside
+            // a single column and the rare straddler is an intra-column
+            // wrapped line that must not be torn apart.
+            const STRADDLE_PARTITION_FRACTION: f32 = 0.25;
+            let partition_by_item = rows_total > 0
+                && (rows_straddle as f32) / (rows_total as f32) >= STRADDLE_PARTITION_FRACTION;
+            if debug_xy {
+                let pad = "  ".repeat(depth as usize);
+                eprintln!(
+                    "[xy d={depth}]{pad}    hist-v straddle={}/{} → partition_by_{}",
+                    rows_straddle,
+                    rows_total,
+                    if partition_by_item { "item" } else { "row" }
+                );
+            }
+
+            if partition_by_item {
+                for &i in &idxs {
+                    if items[i].item.x < cut.position {
+                        left.push(i);
+                    } else {
+                        right.push(i);
+                    }
+                }
             } else {
-                right.push(i);
+                let mut k = 0;
+                while k < sorted_idxs.len() {
+                    let band_y = items[sorted_idxs[k]].item.y;
+                    let mut j = k;
+                    let mut min_x = f32::INFINITY;
+                    while j < sorted_idxs.len()
+                        && (items[sorted_idxs[j]].item.y - band_y).abs() <= band_tol
+                    {
+                        let ix = items[sorted_idxs[j]].item.x;
+                        if ix.is_finite() && ix < min_x {
+                            min_x = ix;
+                        }
+                        j += 1;
+                    }
+                    let side_left = min_x < cut.position;
+                    for &i in &sorted_idxs[k..j] {
+                        if side_left {
+                            left.push(i);
+                        } else {
+                            right.push(i);
+                        }
+                    }
+                    k = j;
+                }
+            }
+        } else {
+            for &i in &idxs {
+                let it = &items[i].item;
+                let split_at = match cut.axis {
+                    CutAxis::Horizontal => it.y + it.height.max(0.0) * 0.5,
+                    CutAxis::Vertical => it.x + it.width.max(0.0) * 0.5,
+                };
+                if split_at < cut.position {
+                    left.push(i);
+                } else {
+                    right.push(i);
+                }
             }
         }
         if debug_xy {
