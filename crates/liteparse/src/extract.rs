@@ -396,6 +396,7 @@ fn extract_page_text_items(
 
     let debug = std::env::var("LITEPARSE_DEBUG").is_ok();
     let dbg_gaps = std::env::var("LITEPARSE_DEBUG_GAPS").is_ok();
+    let space_fix = std::env::var("LITEPARSE_NO_SPACE_FIX").is_err();
 
     // Pre-scan: check if ALL text on this page is invisible (render mode 3).
     // Some scanned PDFs have an invisible OCR text layer as the only text.
@@ -564,10 +565,16 @@ fn extract_page_text_items(
                 };
                 let split = gap >= MAX_INLINE_GAP
                     || (seg.pending_space && gap > seg.avg_char_width() * 2.2);
+                let loose_gap = vp_strict.left - seg.last_char_loose_right;
+                let em_vp = (vp_loose.bottom - vp_loose.top).abs();
+                let space_w = ch.font_space_width().map(|w| w * em_vp).unwrap_or(-1.0);
                 eprintln!(
-                    "[gap] {} gap={:.2} fs={:.2} g/fs={:.2} avgcw={:.2} g/cw={:.2} ps={} -> after='{:.20}' next='{}'",
+                    "[gap] {} gap={:.2} loose={:.2} sw={:.2} g/sw={:.2} fs={:.2} g/fs={:.2} avgcw={:.2} g/cw={:.2} ps={} -> after='{:.20}' next='{}'",
                     if split { "SPLIT" } else { "merge" },
                     gap,
+                    loose_gap,
+                    space_w,
+                    if space_w > 0.0 { loose_gap / space_w } else { 0.0 },
                     fs,
                     if fs > 0.0 { gap / fs } else { 0.0 },
                     seg.avg_char_width(),
@@ -593,6 +600,28 @@ fn extract_page_text_items(
                     seg.append_ligature_tail(ligature_tail);
                 }
             } else {
+                // Missing-space recovery: PDFium sometimes omits the space glyph
+                // between words, fusing them ("of the" -> "ofthe"). Detect it from
+                // the advance-relative gap (measured against the previous char's
+                // LOOSE right edge, so intra-word kerning/overhang is subtracted out)
+                // compared to the font's actual ASCII-space advance. Only fires
+                // between two ASCII alphanumerics, which keeps abbreviation dots,
+                // hyphens, and CJK untouched. When the font exposes no space-glyph
+                // metric (common in embedded subset fonts) fall back to a fraction
+                // of the rendered em height as the space estimate.
+                let em_vp = (vp_loose.bottom - vp_loose.top).abs();
+                let space_w = ch.font_space_width().map(|w| w * em_vp).unwrap_or(0.0);
+                let loose_gap = vp_strict.left - seg.last_char_loose_right;
+                let both_alnum = c.is_ascii_alphanumeric()
+                    && seg.text.chars().last().is_some_and(|p| p.is_ascii_alphanumeric());
+                let thresh = if space_w > 0.0 {
+                    0.7 * space_w
+                } else {
+                    0.35 * em_vp
+                };
+                if space_fix && both_alnum && thresh > 0.0 && loose_gap > thresh {
+                    seg.text.push(' ');
+                }
                 seg.push_char(c, &vp_loose, &vp_strict, &ch);
                 seg.append_ligature_tail(ligature_tail);
             }
@@ -791,6 +820,8 @@ struct SegmentBuilder {
     vp_bottom: f32,
     // Right edge of last char strict bounds (for gap calculation)
     last_char_right: f32,
+    // Right edge of last char LOOSE bounds (advance-relative gap calculation)
+    last_char_loose_right: f32,
     // Bottom of last char strict bounds (for line-change detection)
     last_char_bottom: f32,
     // Count of non-space characters (for avg width calculation)
@@ -824,6 +855,7 @@ impl SegmentBuilder {
             vp_top: f32::MAX,
             vp_bottom: f32::MIN,
             last_char_right: f32::MIN,
+            last_char_loose_right: f32::MIN,
             last_char_bottom: f32::MIN,
             char_count: 0,
             font_name: None,
@@ -877,6 +909,7 @@ impl SegmentBuilder {
         self.vp_top = vp_loose.top;
         self.vp_bottom = vp_loose.bottom;
         self.last_char_right = vp_strict.right;
+        self.last_char_loose_right = vp_loose.right;
         self.last_char_bottom = vp_strict.bottom;
         self.char_count = 1;
         self.has_content = true;
@@ -970,6 +1003,7 @@ impl SegmentBuilder {
         self.vp_top = self.vp_top.min(vp_loose.top);
         self.vp_bottom = self.vp_bottom.max(vp_loose.bottom);
         self.last_char_right = vp_strict.right;
+        self.last_char_loose_right = vp_loose.right;
         self.last_char_bottom = vp_strict.bottom;
         self.char_count += 1;
 
