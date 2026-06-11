@@ -549,6 +549,9 @@ struct SegmentBuilder {
     last_char_bottom: f32,
     // Count of non-space characters (for avg width calculation)
     char_count: usize,
+    // Count of characters whose Unicode came from PDFium's char-code fallback
+    // (no usable ToUnicode / glyph-name mapping, e.g. Type3 fonts).
+    unmapped_char_count: usize,
     // Font metadata (captured from the first character)
     font_name: Option<String>,
     font_size: f32,
@@ -580,6 +583,7 @@ impl SegmentBuilder {
             last_char_right: f32::MIN,
             last_char_bottom: f32::MIN,
             char_count: 0,
+            unmapped_char_count: 0,
             font_name: None,
             font_size: 0.0,
             font_height: None,
@@ -633,6 +637,7 @@ impl SegmentBuilder {
         self.last_char_right = vp_strict.right;
         self.last_char_bottom = vp_strict.bottom;
         self.char_count = 1;
+        self.unmapped_char_count = if ch.has_unicode_map_error() { 1 } else { 0 };
         self.has_content = true;
         self.pending_space = false;
         self.text_width = 0.0;
@@ -726,6 +731,9 @@ impl SegmentBuilder {
         self.last_char_right = vp_strict.right;
         self.last_char_bottom = vp_strict.bottom;
         self.char_count += 1;
+        if ch.has_unicode_map_error() {
+            self.unmapped_char_count += 1;
+        }
 
         // Accumulate glyph width
         if let Some(ref font) = self.font {
@@ -811,6 +819,9 @@ impl SegmentBuilder {
                     None
                 },
                 font_is_buggy: self.font_is_buggy,
+                // Majority vote: a stray mapped char (e.g. a space) inside an
+                // otherwise unmappable Type3 run must not rescue the item.
+                has_unicode_map_error: self.unmapped_char_count * 2 >= self.char_count.max(1),
                 mcid: self.mcid,
                 fill_color: self.fill_color.clone(),
                 stroke_color: self.stroke_color.clone(),

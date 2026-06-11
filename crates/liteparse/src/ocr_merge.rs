@@ -3,7 +3,16 @@ use std::sync::Arc;
 use crate::error::LiteParseError;
 use crate::ocr::{OcrEngine, OcrOptions, OcrResult};
 use crate::types::{Page, TextItem};
-use pdfium::Document;
+use pdfium::{Document, ImageBounds};
+
+/// Minimum dark filled-path area (pt², ~72 DPI page space) not covered by
+/// native text before a page is sent to OCR. 400 pt² is roughly one word at
+/// a 10–12pt size; anything smaller is likely a bullet, icon, dot leader, or
+/// decoration whose loss is acceptable. A false trigger only costs an extra
+/// OCR pass (the overlap filter discards OCR results that duplicate native
+/// text); measured on a 121-page financial report, the trigger fires on ~3
+/// pages at this threshold.
+const UNCOVERED_VECTOR_AREA_THRESHOLD: f32 = 400.0;
 
 /// Owned page bitmap prepared for OCR. Indices refer to positions in the `pages` slice.
 pub(crate) struct RenderedPage {
@@ -24,14 +33,17 @@ pub(crate) fn render_pages_for_ocr(
 ) -> Result<Vec<RenderedPage>, LiteParseError> {
     let mut rendered = Vec::new();
     for (idx, page) in pages.iter().enumerate() {
-        // Count only non-garbled native text. Substitution-cipher-style corrupt
+        // Count only usable native text. Substitution-cipher-style corrupt
         // encodings (e.g. PDFs with a broken cmap) produce long "text" that looks
         // populated but is unreadable — without this, such pages bypass OCR
-        // because text_length >= 20 and coverage looks fine.
+        // because text_length >= 20 and coverage looks fine. The same applies to
+        // unmappable items (Type3 fonts with no ToUnicode), whose text is a
+        // char-code fallback and whose bounding boxes come from deceptive
+        // declared metrics.
         let text_length: usize = page
             .text_items
             .iter()
-            .filter(|item| !is_likely_garbled(&item.text))
+            .filter(|item| !is_unusable_native(item))
             .map(|item| item.text.len())
             .sum();
         let page_obj = document.page((page.page_number - 1) as i32)?;
@@ -41,7 +53,7 @@ pub(crate) fn render_pages_for_ocr(
         let text_bbox_area: f32 = page
             .text_items
             .iter()
-            .filter(|item| !is_likely_garbled(&item.text))
+            .filter(|item| !is_unusable_native(item))
             .map(|item| item.width * item.height)
             .sum();
         let text_coverage = if page_area > 0.0 {
@@ -50,8 +62,21 @@ pub(crate) fn render_pages_for_ocr(
             0.0
         };
 
-        let needs_ocr =
+        let mut needs_ocr =
             text_length < 20 || text_coverage < 0.15 || has_images || page_is_garbled(page);
+
+        // Text drawn as filled vector outlines lives outside the text layer
+        // entirely: no text items, no image XObjects, so none of the above
+        // triggers fire on a text-dense page. Detect it by measuring filled
+        // path area that native text doesn't account for. Checked last so the
+        // page-object walk only runs when the cheap predicates all pass.
+        if !needs_ocr {
+            let path_bounds = page_obj.filled_path_bounds(3.0, 0.9);
+            let uncovered = uncovered_path_area(&path_bounds, &page.text_items);
+
+            needs_ocr = uncovered >= UNCOVERED_VECTOR_AREA_THRESHOLD;
+        }
+
         if !needs_ocr {
             continue;
         }
@@ -163,17 +188,17 @@ pub(crate) async fn ocr_and_merge_rendered(
         }
 
         let page = &mut pages[idx];
-        // Drop garbled native items (e.g. substitution-cipher cmap corruption) so
-        // OCR can replace them. Without this, garbled-but-spatially-present native
-        // text suppresses every OCR result that overlaps it via the overlap check
-        // below, leaving the output stuck with unreadable cipher text. We apply
-        // both per-item and per-page checks: short garbled labels ("GDWH",
-        // "XVG") can't be flagged alone, but their host page can.
+        // Drop unusable native items (substitution-cipher cmap corruption, or
+        // unmappable Type3 text) so OCR can replace them. Without this,
+        // garbled-but-spatially-present native text suppresses every OCR
+        // result that overlaps it via the overlap check below, leaving the
+        // output stuck with unreadable text. We apply both per-item and
+        // per-page checks: short garbled labels ("GDWH", "XVG") can't be
+        // flagged alone, but their host page can.
         if page_is_garbled(page) {
             page.text_items.clear();
         } else {
-            page.text_items
-                .retain(|item| !is_likely_garbled(&item.text));
+            page.text_items.retain(|item| !is_unusable_native(item));
         }
 
         // Only check overlap against native (already-extracted) PDF text. Comparing
@@ -295,14 +320,14 @@ fn page_has_sparse_native_text(page: &Page) -> bool {
     let text_length: usize = page
         .text_items
         .iter()
-        .filter(|item| !is_likely_garbled(&item.text))
+        .filter(|item| !is_unusable_native(item))
         .map(|item| item.text.len())
         .sum();
     let page_area = page.page_width * page.page_height;
     let text_bbox_area: f32 = page
         .text_items
         .iter()
-        .filter(|item| !is_likely_garbled(&item.text))
+        .filter(|item| !is_unusable_native(item))
         .map(|item| item.width * item.height)
         .sum();
     let text_coverage = if page_area > 0.0 {
@@ -312,6 +337,44 @@ fn page_has_sparse_native_text(page: &Page) -> bool {
     };
 
     text_length < 20 || text_coverage < 0.15
+}
+
+/// A native text item that cannot be trusted as a text source: either its
+/// Unicode mapping failed outright (Type3 fonts with no ToUnicode — the text
+/// is a char-code fallback and the bbox comes from deceptive declared
+/// metrics), or its content looks substitution-cipher garbled.
+fn is_unusable_native(item: &TextItem) -> bool {
+    item.has_unicode_map_error || is_likely_garbled(&item.text)
+}
+
+/// Total area of filled vector paths not accounted for by native text items.
+/// Glyph outlines drawn as paths produce filled regions with no overlapping
+/// text item; rules and table borders are stroke-only and already excluded
+/// upstream, and shading rects behind real text are subtracted away by the
+/// text overlap. Coverage is approximated by summing per-item intersections
+/// (clamped to the path's own area), which can only over-estimate coverage —
+/// i.e. err toward not triggering OCR.
+fn uncovered_path_area(paths: &[ImageBounds], items: &[TextItem]) -> f32 {
+    let mut uncovered = 0.0f32;
+    for p in paths {
+        let p_area = p.width * p.height;
+        if p_area <= 0.0 {
+            continue;
+        }
+        let mut covered = 0.0f32;
+        for item in items {
+            let ix = (p.x + p.width).min(item.x + item.width) - p.x.max(item.x);
+            let iy = (p.y + p.height).min(item.y + item.height) - p.y.max(item.y);
+            if ix > 0.0 && iy > 0.0 {
+                covered += ix * iy;
+                if covered >= p_area {
+                    break;
+                }
+            }
+        }
+        uncovered += (p_area - covered).max(0.0);
+    }
+    uncovered
 }
 
 /// Heuristic for substitution-cipher / broken-cmap garbling: real Latin-script
@@ -554,6 +617,58 @@ mod tests {
     #[test]
     fn test_overlaps_empty() {
         assert!(!overlaps_existing_text(&[], 0.0, 0.0, 1.0, 1.0, 0.0));
+    }
+
+    fn pb(x: f32, y: f32, w: f32, h: f32) -> ImageBounds {
+        ImageBounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn test_uncovered_path_area_no_text() {
+        // A sentence-sized outlined region with no native text at all.
+        let paths = vec![pb(50.0, 300.0, 200.0, 12.0)];
+        let area = uncovered_path_area(&paths, &[]);
+        assert!((area - 2400.0).abs() < 1.0);
+        assert!(area >= UNCOVERED_VECTOR_AREA_THRESHOLD);
+    }
+
+    #[test]
+    fn test_uncovered_path_area_fully_covered_by_text() {
+        // Shading rect behind real text: fully covered, must not trigger.
+        let paths = vec![pb(50.0, 300.0, 200.0, 12.0)];
+        let items = vec![make_item(40.0, 295.0, 250.0, 25.0)];
+        let area = uncovered_path_area(&paths, &items);
+        assert_eq!(area, 0.0);
+    }
+
+    #[test]
+    fn test_uncovered_path_area_partial_coverage() {
+        // Half the outlined region is covered by a text item.
+        let paths = vec![pb(0.0, 0.0, 100.0, 10.0)];
+        let items = vec![make_item(0.0, 0.0, 50.0, 10.0)];
+        let area = uncovered_path_area(&paths, &items);
+        assert!((area - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_uncovered_path_area_small_decoration_below_threshold() {
+        // A few bullet-sized filled paths shouldn't reach the threshold.
+        let paths = vec![pb(10.0, 10.0, 8.0, 8.0), pb(10.0, 30.0, 8.0, 8.0)];
+        let area = uncovered_path_area(&paths, &[]);
+        assert!(area < UNCOVERED_VECTOR_AREA_THRESHOLD);
+    }
+
+    #[test]
+    fn test_unusable_native_unicode_map_error() {
+        let mut item = make_item(0.0, 0.0, 10.0, 10.0);
+        assert!(!is_unusable_native(&item));
+        item.has_unicode_map_error = true;
+        assert!(is_unusable_native(&item));
     }
 
     #[test]

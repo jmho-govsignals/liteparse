@@ -72,6 +72,22 @@ pub struct PdfiumBindings {
         unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
     pub FPDFImageObj_GetRenderedBitmap:
         unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_PAGE, FPDF_PAGEOBJECT) -> FPDF_BITMAP,
+    pub FPDFPageObj_GetMatrix: unsafe extern "C" fn(FPDF_PAGEOBJECT, *mut FS_MATRIX) -> FPDF_BOOL,
+    pub FPDFPageObj_GetFillColor: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+    ) -> FPDF_BOOL,
+    pub FPDFPath_GetDrawMode: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        *mut std::os::raw::c_int,
+        *mut FPDF_BOOL,
+    ) -> FPDF_BOOL,
+    pub FPDFFormObj_CountObjects: unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
+    pub FPDFFormObj_GetObject:
+        unsafe extern "C" fn(FPDF_PAGEOBJECT, std::os::raw::c_ulong) -> FPDF_PAGEOBJECT,
 
     // -- TextPage --
     pub FPDFText_LoadPage: unsafe extern "C" fn(FPDF_PAGE) -> FPDF_TEXTPAGE,
@@ -232,6 +248,11 @@ impl PdfiumBindings {
             FPDFPageObj_GetBounds: load_fn!(lib, "FPDFPageObj_GetBounds"),
             FPDFPageObj_GetMarkedContentID: load_fn!(lib, "FPDFPageObj_GetMarkedContentID"),
             FPDFImageObj_GetRenderedBitmap: load_fn!(lib, "FPDFImageObj_GetRenderedBitmap"),
+            FPDFPageObj_GetMatrix: load_fn!(lib, "FPDFPageObj_GetMatrix"),
+            FPDFPageObj_GetFillColor: load_fn!(lib, "FPDFPageObj_GetFillColor"),
+            FPDFPath_GetDrawMode: load_fn!(lib, "FPDFPath_GetDrawMode"),
+            FPDFFormObj_CountObjects: load_fn!(lib, "FPDFFormObj_CountObjects"),
+            FPDFFormObj_GetObject: load_fn!(lib, "FPDFFormObj_GetObject"),
             FPDFText_LoadPage: load_fn!(lib, "FPDFText_LoadPage"),
             FPDFText_ClosePage: load_fn!(lib, "FPDFText_ClosePage"),
             FPDFText_CountChars: load_fn!(lib, "FPDFText_CountChars"),
