@@ -9,6 +9,10 @@ pub struct LiteParseConfig {
     pub ocr_enabled: bool,
     /// HTTP OCR server URL (uses Tesseract if not provided)
     pub ocr_server_url: Option<String>,
+    /// Extra HTTP headers sent with every request to `ocr_server_url`, as
+    /// `(name, value)` pairs. Use for auth, e.g. `("Authorization", "Bearer …")`.
+    /// Ignored when `ocr_server_url` is None.
+    pub ocr_server_headers: Vec<(String, String)>,
     /// Path to tessdata directory. Falls back to TESSDATA_PREFIX env var if not set.
     pub tessdata_path: Option<String>,
     /// Maximum number of pages to parse.
@@ -70,6 +74,7 @@ impl Default for LiteParseConfig {
             ocr_language: "eng".to_string(),
             ocr_enabled: true,
             ocr_server_url: None,
+            ocr_server_headers: Vec::new(),
             tessdata_path: None,
             max_pages: 1000,
             target_pages: None,

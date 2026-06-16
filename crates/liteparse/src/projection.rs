@@ -3041,6 +3041,15 @@ const XY_COLUMN_PEAK_BALANCE_RATIO: f32 = 0.4;
 /// detector) on sparse tabular layouts.
 const XY_COLUMN_MIN_FILL: f32 = 0.55;
 
+/// A peak whose band count is below this fraction of the most-banded column's
+/// is treated as a figure-scatter "phantom" (axis tick labels, a point cloud
+/// spread across x) rather than a real column. Real table columns have one
+/// cell per row, so their band counts are comparable to their siblings; a
+/// plot embedded in 2-column prose contributes a sparse, low-fill third peak
+/// that would otherwise flip the whole region to `tabular` and suppress the
+/// genuine column split. See the phantom-drop in `xy_find_column_cut`.
+const XY_COLUMN_PHANTOM_BAND_FRACTION: f32 = 0.25;
+
 #[derive(Debug, Clone, Copy)]
 struct CutCandidate {
     axis: CutAxis,
@@ -3655,7 +3664,7 @@ fn xy_find_column_cut(
     // the rows whole. Per band, measure each column's covered span / slot
     // width; if too sparse, treat as a table and bail.
     {
-        let n = peaks.len();
+        let mut n = peaks.len();
         let mut covered_sum = vec![0.0f32; n];
         let mut band_count = vec![0usize; n];
         let mut kk = 0;
@@ -3728,7 +3737,7 @@ fn xy_find_column_cut(
                 weighted_n += band_count[c] as f32;
             }
         }
-        let avg_fill = if weighted_n > 0.0 {
+        let mut avg_fill = if weighted_n > 0.0 {
             weighted_sum / weighted_n
         } else {
             f32::INFINITY
@@ -3749,6 +3758,61 @@ fn xy_find_column_cut(
             );
         }
         const MIN_FILL_HARD_FLOOR: f32 = 0.38;
+        // Figure-scatter phantom column: on a 2-column page with an embedded
+        // plot (scatter cloud, axis tick labels), the plot's x-spread items
+        // form a third peak that is BOTH sparsely-banded (far fewer text rows
+        // than the real columns) and low-fill. Left in, it drags min_fill
+        // under the floor and flips the whole region to `tabular`, suppressing
+        // the genuine column split. A real narrow table column instead has a
+        // band count comparable to its siblings (one cell per row), so the
+        // band-count ratio cleanly separates the two. Drop phantom peaks when
+        // ≥2 well-filled columns survive, then re-run the gate on them.
+        if n > 2 && std::env::var("LITEPARSE_DISABLE_PHANTOM_COL_DROP").is_err() {
+            let max_bands = band_count.iter().copied().max().unwrap_or(0);
+            if max_bands > 0 {
+                let band_floor =
+                    (max_bands as f32 * XY_COLUMN_PHANTOM_BAND_FRACTION).ceil() as usize;
+                let col_fill = |c: usize| -> f32 {
+                    if band_count[c] > 0 {
+                        covered_sum[c] / band_count[c] as f32
+                    } else {
+                        0.0
+                    }
+                };
+                let survivors: Vec<usize> = (0..n)
+                    .filter(|&c| !(band_count[c] < band_floor && col_fill(c) < MIN_FILL_HARD_FLOOR))
+                    .collect();
+                let survivors_filled = survivors
+                    .iter()
+                    .all(|&c| col_fill(c) >= MIN_FILL_HARD_FLOOR);
+                if survivors.len() >= 2 && survivors.len() < n && survivors_filled {
+                    let kept: Vec<(f32, usize)> = survivors.iter().map(|&c| peaks[c]).collect();
+                    let mut new_min = f32::INFINITY;
+                    let mut wsum = 0.0f32;
+                    let mut wn = 0.0f32;
+                    for &c in &survivors {
+                        let f = col_fill(c);
+                        new_min = new_min.min(f);
+                        wsum += f * band_count[c] as f32;
+                        wn += band_count[c] as f32;
+                    }
+                    if dbg {
+                        eprintln!(
+                            "[xy col-phantom] dropped {} sparse low-fill peak(s) (band_floor={band_floor}); kept xs=[{}]",
+                            n - survivors.len(),
+                            kept.iter()
+                                .map(|(x, _)| format!("{x:.0}"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
+                    }
+                    peaks = kept;
+                    n = peaks.len();
+                    min_fill = new_min;
+                    avg_fill = if wn > 0.0 { wsum / wn } else { f32::INFINITY };
+                }
+            }
+        }
         // The min-floor catches ≥3-col tables whose narrow numeric column is
         // diluted out of the weighted average by wide neighbors. With only 2
         // columns no dilution is possible — a sparse column of two drags the

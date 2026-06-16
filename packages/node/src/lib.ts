@@ -4,6 +4,7 @@ import {
   type LiteParseNativeConfig,
   type NativeParseResult,
   type NativeParsedPage,
+  type NativePageInput,
   type NativeTextItem,
   type NativeExtractedImage,
 } from "./native.js";
@@ -44,6 +45,46 @@ export interface TextItem {
   fontName?: string;
   fontSize?: number;
   confidence?: number;
+  /** Rotation in degrees (viewport space). Defaults to 0 when omitted. */
+  rotation?: number;
+}
+
+/**
+ * A vector-graphic primitive supplied to {@link LiteParse.parsePages}. `kind`
+ * selects the variant: `"stroke"` (uses `x1/y1/x2/y2`) or `"rect"` (uses
+ * `x/y/width/height`, top-left origin). Coordinates are viewport space (72 DPI),
+ * matching the text items. `hasFill`/`hasStroke` carry the paint intent even
+ * when the color is unknown, so ruled-table edge detection still treats a
+ * colorless stroked rect as stroked.
+ */
+export interface Graphic {
+  kind: "stroke" | "rect";
+  x1?: number;
+  y1?: number;
+  x2?: number;
+  y2?: number;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  hasFill?: boolean;
+  hasStroke?: boolean;
+  fillColor?: string;
+  strokeColor?: string;
+  lineWidth?: number;
+}
+
+/**
+ * A page of pre-extracted text supplied to {@link LiteParse.parsePages}.
+ * Coordinates are viewport space (top-left origin, 72 DPI). `graphics` is
+ * optional; when supplied it enables ruled-table and horizontal-rule detection.
+ */
+export interface PageInput {
+  pageNumber: number;
+  pageWidth: number;
+  pageHeight: number;
+  textItems: TextItem[];
+  graphics?: Graphic[];
 }
 
 export interface ParsedPage {
@@ -129,6 +170,28 @@ export class LiteParse {
     const nativeInput =
       typeof input === "string" ? input : Buffer.from(input);
     const result: NativeParseResult = await this._native.parse(nativeInput);
+    return {
+      pages: result.pages.map(toPage),
+      text: result.text,
+      images: (result.images ?? []).map(toImage),
+    };
+  }
+
+  /**
+   * Parse from pre-extracted pages, skipping PDFium text extraction. Runs only
+   * grid projection + the configured output formatter, so the caller's own
+   * text-extraction / font-recovery owns the text content. Synchronous: no
+   * PDFium load and no OCR on this path.
+   */
+  parsePages(pages: PageInput[]): ParseResult {
+    const nativePages: NativePageInput[] = pages.map((p) => ({
+      pageNumber: p.pageNumber,
+      pageWidth: p.pageWidth,
+      pageHeight: p.pageHeight,
+      textItems: p.textItems,
+      graphics: p.graphics,
+    }));
+    const result = this._native.parsePages(nativePages);
     return {
       pages: result.pages.map(toPage),
       text: result.text,

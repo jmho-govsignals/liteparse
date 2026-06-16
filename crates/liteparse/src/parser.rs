@@ -13,7 +13,7 @@ use crate::output::markdown;
 use crate::projection;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::render;
-use crate::types::{ExtractedImage, OutlineTarget, ParsedPage, PdfInput};
+use crate::types::{ExtractedImage, OutlineTarget, Page, ParsedPage, PdfInput};
 use pdfium::Library;
 
 /// Result of parsing a document.
@@ -176,7 +176,10 @@ impl LiteParse {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     if let Some(ref url) = self.config.ocr_server_url {
-                        std::sync::Arc::new(HttpOcrEngine::new(url.clone()))
+                        std::sync::Arc::new(HttpOcrEngine::with_headers(
+                            url.clone(),
+                            self.config.ocr_server_headers.clone(),
+                        ))
                     } else {
                         #[cfg(feature = "tesseract")]
                         {
@@ -246,6 +249,35 @@ impl LiteParse {
             outline,
             images,
         })
+    }
+
+    /// Parse from pre-extracted pages, skipping PDFium text extraction.
+    ///
+    /// The caller supplies `Page`s already populated with text items (and,
+    /// optionally, graphics / struct nodes / image refs) in viewport space
+    /// (top-left origin, 72 DPI). This runs only grid projection and the
+    /// configured output formatter, so it touches neither PDFium nor OCR and
+    /// is fully synchronous. Used when an external extractor (e.g. with its
+    /// own font-recovery pipeline) owns text extraction.
+    pub fn parse_from_pages(&self, pages: Vec<Page>, outline: Vec<OutlineTarget>) -> ParseResult {
+        let parsed_pages = projection::project_pages_to_grid(pages);
+
+        let full_text = if self.config.output_format == crate::config::OutputFormat::Markdown {
+            markdown::format_markdown(&parsed_pages, &outline, self.config.image_mode)
+        } else {
+            parsed_pages
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
+        ParseResult {
+            pages: parsed_pages,
+            text: full_text,
+            outline,
+            images: Vec::new(),
+        }
     }
 
     /// Generate screenshots of document pages as PNG bytes.
